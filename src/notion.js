@@ -214,6 +214,28 @@ function bucketByTeam(blocks) {
 }
 
 // Returns { reactions: { teamNum: { attendee: markdown } }, teamDescriptors: { num: str } }
+// Per-notebook content cache keyed on pageId. Stores the parsed buckets
+// alongside the last_edited_time we saw — so a refresh only does the
+// expensive listAllBlocks walk when a notebook actually changed.
+// Notebooks with stale last_edited_time return cached buckets instantly.
+const notebookContentCache = new Map(); // pageId -> { lastEditedTime, buckets }
+
+// Run async tasks with a concurrency cap — prevents bursting past Notion's
+// 3 req/s rate limit when many notebooks need refreshing at once.
+async function withConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export async function fetchAllReactions() {
   const client = getNotion();
   if (!client) throw new Error('NOTION_TOKEN not set');
@@ -222,24 +244,36 @@ export async function fetchAllReactions() {
   const reactions = {};
   const teamDescriptors = {};
   const errors = [];
+  let hits = 0;
+  let misses = 0;
 
-  await Promise.all(
-    notebooks.map(async (nb) => {
-      try {
+  await withConcurrency(notebooks, 2, async (nb) => {
+    try {
+      const cached = notebookContentCache.get(nb.pageId);
+      let buckets;
+      if (cached && cached.lastEditedTime && cached.lastEditedTime === nb.lastEditedTime) {
+        buckets = cached.buckets;
+        hits++;
+      } else {
         const blocks = await listAllBlocks(client, nb.pageId);
-        const buckets = bucketByTeam(blocks);
-        for (const [num, { descriptor, text }] of Object.entries(buckets)) {
-          if (descriptor && !teamDescriptors[num]) teamDescriptors[num] = descriptor;
-          if (!reactions[num]) reactions[num] = {};
-          reactions[num][nb.name] = text;
-        }
-      } catch (e) {
-        const msg = String(e?.message || e);
-        errors.push({ notebook: nb.name, error: msg });
-        console.error(`[notion] ${nb.name} (${nb.pageId}): ${msg}`);
+        buckets = bucketByTeam(blocks);
+        notebookContentCache.set(nb.pageId, { lastEditedTime: nb.lastEditedTime, buckets });
+        misses++;
       }
-    })
-  );
+      for (const [num, { descriptor, text }] of Object.entries(buckets)) {
+        if (descriptor && !teamDescriptors[num]) teamDescriptors[num] = descriptor;
+        if (!reactions[num]) reactions[num] = {};
+        reactions[num][nb.name] = text;
+      }
+    } catch (e) {
+      const msg = String(e?.message || e);
+      errors.push({ notebook: nb.name, error: msg });
+      console.error(`[notion] ${nb.name} (${nb.pageId}): ${msg}`);
+    }
+  });
 
+  if (misses > 0) {
+    console.log(`[notion] fetched ${notebooks.length} notebook(s): ${hits} cached, ${misses} refetched`);
+  }
   return { reactions, teamDescriptors, errors };
 }
