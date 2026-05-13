@@ -271,7 +271,7 @@ function ByAttendeeView({ data, isFlashing }) {
         const empty = teams.length === 0;
         const lastEdit = formatRelativeTime(r?.lastEditedTime);
         return (
-          <section key={name} className={empty ? 'opacity-60' : ''}>
+          <section key={name} id={`attendee-${name.replace(/\s+/g,'-')}`} className={['scroll-mt-32', empty ? 'opacity-60' : ''].join(' ')}>
             <header className="mb-3 flex items-baseline justify-between gap-3 flex-wrap">
               <div className="flex items-baseline gap-3">
                 <h2 className="font-serif text-[22px] sm:text-[24px] tracking-tight text-ink-900">{name}</h2>
@@ -317,10 +317,16 @@ function ByAttendeeView({ data, isFlashing }) {
 }
 
 function AddAttendeeBar() {
+  const [open, setOpen] = useState(false);
   const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (open && inputRef.current) inputRef.current.focus();
+  }, [open]);
 
   async function onAdd() {
     if (!name.trim() || busy) return;
@@ -346,66 +352,132 @@ function AddAttendeeBar() {
     }
   }
 
+  if (!open && !result && !error) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        className="text-[11px] font-mono text-ink-500 hover:text-amber-600 underline decoration-dotted underline-offset-2 mt-1.5"
+      >
+        + add attendee
+      </button>
+    );
+  }
+
   return (
     <div className="mt-2 flex flex-wrap items-baseline gap-2 text-[12px] font-mono">
-      <span className="text-ink-500 uppercase tracking-wider">add attendee:</span>
-      <input
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        onKeyDown={(e) => e.key === 'Enter' && onAdd()}
-        placeholder="name (e.g. Aria Chen)"
-        className="border border-ink-200 bg-white/70 rounded px-2 py-0.5 text-[12px] min-w-[180px]"
-      />
-      <button
-        onClick={onAdd}
-        disabled={busy || !name.trim()}
-        className="bg-ink-900 text-ink-50 rounded px-2.5 py-0.5 text-[12px] disabled:opacity-40 hover:bg-amber-600 transition-colors"
-      >
-        {busy ? 'claiming…' : 'claim notebook'}
-      </button>
+      {open && (
+        <>
+          <input
+            ref={inputRef}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') onAdd();
+              if (e.key === 'Escape') { setOpen(false); setName(''); }
+            }}
+            placeholder="new attendee name"
+            className="border border-ink-200 bg-white/70 rounded px-2 py-0.5 text-[12px] min-w-[180px]"
+          />
+          <button
+            onClick={onAdd}
+            disabled={busy || !name.trim()}
+            className="bg-ink-900 text-ink-50 rounded px-2.5 py-0.5 text-[12px] disabled:opacity-40 hover:bg-amber-600 transition-colors"
+          >
+            {busy ? 'claiming…' : 'claim'}
+          </button>
+          <button
+            onClick={() => { setOpen(false); setName(''); setError(null); }}
+            className="text-ink-500 hover:text-ink-900 text-[12px]"
+          >
+            cancel
+          </button>
+        </>
+      )}
       {result && (
-        <span className="text-emerald-700">
-          ✓ <span className="text-ink-500">{result.previousName} →</span> <span className="font-semibold">{result.newName}</span>
-          {' · '}
-          <a href={result.url} target="_blank" rel="noreferrer" className="underline decoration-dotted underline-offset-2 hover:text-amber-600">
+        <span className="text-emerald-700 inline-flex items-baseline gap-1">
+          ✓ <span className="font-semibold">{result.newName}</span>
+          <a href={result.url} target="_blank" rel="noreferrer" className="underline decoration-dotted underline-offset-2 hover:text-amber-600 ml-1">
             open in Notion ↗
           </a>
+          <button onClick={() => setResult(null)} className="ml-2 text-ink-300 hover:text-ink-900">×</button>
         </span>
       )}
-      {error && <span className="text-red-600">{error}</span>}
+      {error && (
+        <span className="text-red-600 inline-flex items-baseline gap-2">
+          {error}
+          <button onClick={() => setError(null)} className="text-ink-300 hover:text-ink-900">×</button>
+        </span>
+      )}
     </div>
   );
 }
 
 function PresentingPicker({ teams, current, onChange }) {
+  const [expanded, setExpanded] = useState(false);
+  const activeTeam = current != null ? teams.find((t) => t.num === current) : null;
+
+  // If a team IS selected, show a prominent callout. Otherwise show a small
+  // toggle that expands into the team picker on demand.
+  if (activeTeam && !expanded) {
+    return (
+      <div className="inline-flex items-baseline gap-2 text-[12px] font-mono bg-amber-50/70 border border-amber-400/60 rounded px-2.5 py-1">
+        <span className="text-amber-700">🎤 now presenting:</span>
+        <span className="font-semibold text-ink-900">Team {activeTeam.num}</span>
+        {activeTeam.descriptor && <span className="text-ink-700 italic">— {activeTeam.descriptor}</span>}
+        <button
+          onClick={() => setExpanded(true)}
+          className="ml-1 text-ink-500 hover:text-amber-600 underline decoration-dotted underline-offset-2"
+        >
+          change
+        </button>
+        <button
+          onClick={() => onChange(null)}
+          className="text-ink-300 hover:text-ink-900"
+          title="Clear"
+        >
+          ×
+        </button>
+      </div>
+    );
+  }
+
+  if (!expanded) {
+    return (
+      <button
+        onClick={() => setExpanded(true)}
+        className="text-[11px] font-mono text-ink-500 hover:text-amber-600 underline decoration-dotted underline-offset-2"
+      >
+        🎤 mark a team as currently presenting
+      </button>
+    );
+  }
+
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      <span className="text-[11px] uppercase tracking-wider text-ink-500 font-mono mr-1">presenting:</span>
-      <button
-        onClick={() => onChange(null)}
-        className={[
-          'text-[12px] px-2 py-1 rounded font-mono border',
-          current == null
-            ? 'bg-ink-900 text-ink-50 border-ink-900'
-            : 'bg-white text-ink-500 border-ink-200 hover:border-ink-500',
-        ].join(' ')}
-      >
-        none
-      </button>
+      <span className="text-[11px] uppercase tracking-wider text-ink-500 font-mono mr-1">
+        🎤 tap the team being presented:
+      </span>
       {teams.map((t) => (
         <button
           key={t.num}
-          onClick={() => onChange(t.num)}
+          onClick={() => { onChange(t.num); setExpanded(false); }}
           className={[
             'text-[12px] w-7 h-7 rounded font-mono border',
             current === t.num
               ? 'bg-amber-500 text-white border-amber-500'
               : 'bg-white text-ink-700 border-ink-200 hover:border-amber-400',
           ].join(' ')}
+          title={t.descriptor || `Team ${t.num}`}
         >
           {t.num}
         </button>
       ))}
+      <button
+        onClick={() => { onChange(null); setExpanded(false); }}
+        className="text-[12px] px-2 py-0.5 ml-1 text-ink-500 hover:text-ink-900 font-mono"
+      >
+        cancel
+      </button>
     </div>
   );
 }
@@ -603,31 +675,50 @@ export default function App() {
           </div>
           {data?.mode === 'notion' && <AddAttendeeBar />}
           {data?.roster?.length > 0 && (
-            <div className="mt-2 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[12px] font-mono">
+            <div className="mt-2 flex flex-wrap items-baseline gap-x-1.5 gap-y-1 text-[12px] font-mono">
               <span className="text-ink-500 uppercase tracking-wider mr-1">roster:</span>
               {data.roster.map((r, i) => {
                 const hasReactions = !!data.reactions && Object.values(data.reactions).some((byA) => byA[r.name] && byA[r.name].trim());
                 return (
                   <React.Fragment key={r.name}>
                     {i > 0 && <span className="text-ink-300">·</span>}
-                    <a
-                      href={r.url || '#'}
-                      target="_blank"
-                      rel="noreferrer"
-                      className={[
-                        'hover:text-amber-600 transition-colors',
-                        hasReactions ? 'text-ink-900 font-semibold' : 'text-ink-500',
-                      ].join(' ')}
-                      title={hasReactions ? 'has reactions — click to open in Notion' : 'no reactions yet — click to open in Notion'}
-                    >
-                      {r.name}
-                      {hasReactions && <span className="ml-0.5 text-amber-500">●</span>}
-                    </a>
+                    <span className="inline-flex items-baseline">
+                      <button
+                        onClick={() => {
+                          setView('by-attendee');
+                          // wait one frame so the by-attendee tab renders, then scroll
+                          requestAnimationFrame(() => {
+                            const el = document.getElementById(`attendee-${r.name.replace(/\s+/g,'-')}`);
+                            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                          });
+                        }}
+                        className={[
+                          'hover:text-amber-600 transition-colors',
+                          hasReactions ? 'text-ink-900 font-semibold' : 'text-ink-500',
+                        ].join(' ')}
+                        title={`Show ${r.name}'s reactions across all teams`}
+                      >
+                        {r.name}
+                        {hasReactions && <span className="ml-0.5 text-amber-500">●</span>}
+                      </button>
+                      {r.url && (
+                        <a
+                          href={r.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="ml-0.5 text-ink-300 hover:text-amber-600"
+                          title="Open notebook in Notion"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          ↗
+                        </a>
+                      )}
+                    </span>
                   </React.Fragment>
                 );
               })}
               <span className="text-ink-300 ml-1">
-                {data.roster.length === 1 ? '(1 notebook)' : `(${data.roster.length} notebooks)`}
+                {data.roster.length === 1 ? '(1)' : `(${data.roster.length})`}
               </span>
             </div>
           )}
