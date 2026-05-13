@@ -316,6 +316,67 @@ function ByAttendeeView({ data, isFlashing }) {
   );
 }
 
+function AddAttendeeBar() {
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  async function onAdd() {
+    if (!name.trim() || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/add-attendee', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.trim() }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        setError(json.error || `HTTP ${res.status}`);
+      } else {
+        setResult(json);
+        setName('');
+      }
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-2 flex flex-wrap items-baseline gap-2 text-[12px] font-mono">
+      <span className="text-ink-500 uppercase tracking-wider">add attendee:</span>
+      <input
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => e.key === 'Enter' && onAdd()}
+        placeholder="name (e.g. Aria Chen)"
+        className="border border-ink-200 bg-white/70 rounded px-2 py-0.5 text-[12px] min-w-[180px]"
+      />
+      <button
+        onClick={onAdd}
+        disabled={busy || !name.trim()}
+        className="bg-ink-900 text-ink-50 rounded px-2.5 py-0.5 text-[12px] disabled:opacity-40 hover:bg-amber-600 transition-colors"
+      >
+        {busy ? 'claiming…' : 'claim notebook'}
+      </button>
+      {result && (
+        <span className="text-emerald-700">
+          ✓ <span className="text-ink-500">{result.previousName} →</span> <span className="font-semibold">{result.newName}</span>
+          {' · '}
+          <a href={result.url} target="_blank" rel="noreferrer" className="underline decoration-dotted underline-offset-2 hover:text-amber-600">
+            open in Notion ↗
+          </a>
+        </span>
+      )}
+      {error && <span className="text-red-600">{error}</span>}
+    </div>
+  );
+}
+
 function PresentingPicker({ teams, current, onChange }) {
   return (
     <div className="flex flex-wrap items-center gap-1.5">
@@ -540,6 +601,7 @@ export default function App() {
               </button>
             </div>
           </div>
+          {data?.mode === 'notion' && <AddAttendeeBar />}
           {data?.roster?.length > 0 && (
             <div className="mt-2 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[12px] font-mono">
               <span className="text-ink-500 uppercase tracking-wider mr-1">roster:</span>

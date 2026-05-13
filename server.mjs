@@ -6,7 +6,7 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
-import { fetchAllReactions, getNotion, getNotebooks } from './src/notion.js';
+import { fetchAllReactions, getNotion, getNotebooks, claimPlaceholder } from './src/notion.js';
 import { SEED_REACTIONS, NOTEBOOK_URLS, TEAMS, ATTENDEES } from './src/mockData.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -169,6 +169,26 @@ async function main() {
     if (!mockReactions[team]) mockReactions[team] = {};
     mockReactions[team][attendee] = text;
     res.json({ ok: true });
+  });
+
+  // Claim a placeholder notebook and rename it for a new attendee.
+  // POST { name } -> { url, previousName, newName }  (or 503 if no placeholders left)
+  app.post('/api/add-attendee', async (req, res) => {
+    if (!getNotion()) return res.status(400).json({ error: 'Live Notion mode required' });
+    const name = (req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'name required' });
+    if (name.length > 80) return res.status(400).json({ error: 'name too long (max 80 chars)' });
+    try {
+      const claimed = await claimPlaceholder(name);
+      if (!claimed) {
+        return res.status(503).json({ error: 'No placeholder notebooks left — Duplicate one manually in Notion.' });
+      }
+      console.log(`[add-attendee] ${claimed.previousName} → ${claimed.newName}`);
+      res.json(claimed);
+    } catch (e) {
+      console.error('[add-attendee]', e?.message || e);
+      res.status(500).json({ error: String(e?.message || e) });
+    }
   });
 
   app.get('/api/presenting', (_req, res) => res.json({ currentlyPresenting }));

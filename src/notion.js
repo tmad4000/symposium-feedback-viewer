@@ -100,6 +100,29 @@ export function getNotebooks() {
   return notebookCache.list;
 }
 
+// Claim a placeholder notebook by renaming it. Looks for an "Attendee N"
+// notebook (or any title containing the word "Attendee") and renames it
+// to the given name. Returns the renamed notebook info, or null if no
+// placeholder is available.
+export async function claimPlaceholder(newName) {
+  const client = getNotion();
+  if (!client) throw new Error('NOTION_TOKEN not set');
+  // Always re-discover so we work against current Notion state, not stale cache
+  notebookCache = { at: 0, list: [] };
+  const notebooks = await discoverNotebooks();
+  const placeholder = notebooks.find((nb) => /^attendee\s+\d+$/i.test(nb.name));
+  if (!placeholder) return null;
+  const title = `📓 ${newName} — notebook`;
+  await client.pages.update({
+    page_id: placeholder.pageId,
+    properties: { title: { title: [{ type: 'text', text: { content: title } }] } },
+  });
+  // Invalidate caches so the rename surfaces on next poll
+  notebookCache = { at: 0, list: [] };
+  syncedBlockCache.delete(placeholder.pageId);
+  return { previousName: placeholder.name, newName, url: placeholder.url, pageId: placeholder.pageId };
+}
+
 // List ONE level of children (no recursion). Used to read the notebook's
 // top-level structure (H2 + synced_block placeholders) and to read the
 // children of a specific synced_block.
