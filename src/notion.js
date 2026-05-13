@@ -90,6 +90,22 @@ function parseTeamHeading(text) {
   return { num: parseInt(m[1], 10), descriptor: m[2] ? m[2].trim() : null };
 }
 
+// Synced-block placeholders to ignore. The v5 template seeds every synced
+// block with "(your reactions here)" so attendees know where to type. That
+// text is NOT real content — treating it as a reaction defeats the whole
+// point of this read-view.
+function isPlaceholder(line) {
+  if (!line) return true;
+  // Strip markdown emphasis + parens + whitespace, lowercase, then compare.
+  const stripped = line.replace(/[\*_()`]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!stripped) return true;
+  if (/^your\s+reactions?\s+here$/.test(stripped)) return true;
+  if (/^your\s+notes?\s+here$/.test(stripped)) return true;
+  if (/^type\s+your\s+reactions?\s+here$/.test(stripped)) return true;
+  if (/^reactions?\s+here$/.test(stripped)) return true;
+  return false;
+}
+
 // Given the blocks of one notebook, split into per-team buckets.
 function bucketByTeam(blocks) {
   const buckets = {}; // teamNum -> { descriptor, lines: [] }
@@ -110,7 +126,7 @@ function bucketByTeam(blocks) {
     }
     if (current == null) continue;
     const md = blockToMarkdown(b).trim();
-    if (md) buckets[current].lines.push(md);
+    if (md && !isPlaceholder(md)) buckets[current].lines.push(md);
   }
   // Join lines into markdown blocks
   const out = {};
