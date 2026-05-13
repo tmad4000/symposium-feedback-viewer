@@ -100,26 +100,15 @@ export function getNotebooks() {
   return notebookCache.list;
 }
 
-// Pull a flat array of richtext-bearing blocks from a page (including
-// children of synced_blocks, which is where the actual content lives).
-async function listAllBlocks(client, blockId, depth = 0) {
-  if (depth > 4) return [];
+// List ONE level of children (no recursion). Used to read the notebook's
+// top-level structure (H2 + synced_block placeholders) and to read the
+// children of a specific synced_block.
+async function listDirectChildren(client, blockId) {
   const blocks = [];
   let cursor;
   do {
     const res = await client.blocks.children.list({ block_id: blockId, start_cursor: cursor, page_size: 100 });
-    for (const b of res.results) {
-      blocks.push(b);
-      // Recurse into synced blocks (and their referenced originals) and toggles to capture nested content
-      if (b.type === 'synced_block' || b.has_children) {
-        try {
-          const children = await listAllBlocks(client, b.id, depth + 1);
-          blocks.push(...children.map((c) => ({ ...c, _parentType: b.type })));
-        } catch (e) {
-          // ignore individual failures
-        }
-      }
-    }
+    blocks.push(...res.results);
     cursor = res.has_more ? res.next_cursor : undefined;
   } while (cursor);
   return blocks;
@@ -182,43 +171,23 @@ function isPlaceholder(line) {
   return false;
 }
 
-// Given the blocks of one notebook, split into per-team buckets.
-function bucketByTeam(blocks) {
-  const buckets = {}; // teamNum -> { descriptor, lines: [] }
-  let current = null;
-  for (const b of blocks) {
-    if (b.type === 'heading_2') {
-      const text = (b.heading_2.rich_text || []).map((r) => r.plain_text).join('');
-      const parsed = parseTeamHeading(text);
-      if (parsed) {
-        current = parsed.num;
-        if (!buckets[current]) buckets[current] = { descriptor: parsed.descriptor, lines: [] };
-        else if (!buckets[current].descriptor && parsed.descriptor) buckets[current].descriptor = parsed.descriptor;
-        continue;
-      }
-      // unrelated H2 — close current bucket
-      current = null;
-      continue;
-    }
-    if (current == null) continue;
+// Convert a list of synced_block children to filtered markdown text.
+function renderChildrenAsMarkdown(children) {
+  const lines = [];
+  for (const b of children) {
     const md = blockToMarkdown(b).trim();
-    if (md && !isPlaceholder(md)) buckets[current].lines.push(md);
+    if (md && !isPlaceholder(md)) lines.push(md);
   }
-  // Join lines into markdown blocks
-  const out = {};
-  for (const [num, { descriptor, lines }] of Object.entries(buckets)) {
-    const text = lines.join('\n\n').trim();
-    if (text) out[num] = { descriptor, text };
-  }
-  return out;
+  return lines.join('\n\n').trim();
 }
 
 // Returns { reactions: { teamNum: { attendee: markdown } }, teamDescriptors: { num: str } }
-// Per-notebook content cache keyed on pageId. Stores the parsed buckets
-// alongside the last_edited_time we saw — so a refresh only does the
-// expensive listAllBlocks walk when a notebook actually changed.
-// Notebooks with stale last_edited_time return cached buckets instantly.
-const notebookContentCache = new Map(); // pageId -> { lastEditedTime, buckets }
+// Synced-block content cache keyed on blockId. Stores the rendered markdown
+// alongside the synced_block's own last_edited_time. The PAGE's
+// last_edited_time does NOT bump when a child synced_block's content
+// changes (verified empirically), so caching at page level misses live
+// edits. Each synced block has its own last_edited_time that DOES bump.
+const syncedBlockCache = new Map(); // blockId -> { lastEditedTime, text }
 
 // Run async tasks with a concurrency cap — prevents bursting past Notion's
 // 3 req/s rate limit when many notebooks need refreshing at once.
@@ -236,34 +205,85 @@ async function withConcurrency(items, limit, fn) {
   return results;
 }
 
+// Returns the parsed team-buckets for a single notebook by:
+//   1. Listing the page's direct children (1 API call) — gets H2 headings
+//      and synced_block stubs (each with its OWN last_edited_time)
+//   2. For each synced_block, comparing its last_edited_time to the cache
+//   3. Fetching the synced_block's children (1 API call) only if changed
+//
+// Returns { teamBuckets, hits, misses, latestEdit } where latestEdit is the
+// most recent last_edited_time across the page's synced blocks (used by the
+// UI for "edited Xs ago" ordering).
+async function fetchNotebookBuckets(client, pageId) {
+  const topLevel = await listDirectChildren(client, pageId);
+  const teamBuckets = {}; // teamNum -> { descriptor, text, lastEditedTime }
+  let currentTeam = null;
+  let currentDescriptor = null;
+  let hits = 0;
+  let misses = 0;
+  let latestEdit = null;
+
+  for (const b of topLevel) {
+    if (b.type === 'heading_2') {
+      const text = (b.heading_2?.rich_text || []).map((r) => r.plain_text).join('');
+      const parsed = parseTeamHeading(text);
+      if (parsed) {
+        currentTeam = parsed.num;
+        currentDescriptor = parsed.descriptor || null;
+      } else {
+        currentTeam = null;
+        currentDescriptor = null;
+      }
+      continue;
+    }
+    if (b.type !== 'synced_block') continue;
+    if (currentTeam == null) continue;
+
+    const blockId = b.id;
+    const blockEdit = b.last_edited_time;
+    if (blockEdit && (!latestEdit || blockEdit > latestEdit)) latestEdit = blockEdit;
+
+    const cached = syncedBlockCache.get(blockId);
+    let text;
+    if (cached && cached.lastEditedTime === blockEdit) {
+      text = cached.text;
+      hits++;
+    } else {
+      const children = await listDirectChildren(client, blockId);
+      text = renderChildrenAsMarkdown(children);
+      syncedBlockCache.set(blockId, { lastEditedTime: blockEdit, text });
+      misses++;
+    }
+    if (text) {
+      teamBuckets[currentTeam] = { descriptor: currentDescriptor, text, lastEditedTime: blockEdit };
+    }
+  }
+  return { teamBuckets, hits, misses, latestEdit };
+}
+
 export async function fetchAllReactions() {
   const client = getNotion();
   if (!client) throw new Error('NOTION_TOKEN not set');
 
   const notebooks = await discoverNotebooks();
-  const reactions = {};
+  const reactions = {};                // teamNum -> { attendeeName: text }
+  const reactionEdits = {};            // teamNum -> { attendeeName: lastEditedTime }
   const teamDescriptors = {};
   const errors = [];
-  let hits = 0;
-  let misses = 0;
+  let totalHits = 0;
+  let totalMisses = 0;
 
   await withConcurrency(notebooks, 2, async (nb) => {
     try {
-      const cached = notebookContentCache.get(nb.pageId);
-      let buckets;
-      if (cached && cached.lastEditedTime && cached.lastEditedTime === nb.lastEditedTime) {
-        buckets = cached.buckets;
-        hits++;
-      } else {
-        const blocks = await listAllBlocks(client, nb.pageId);
-        buckets = bucketByTeam(blocks);
-        notebookContentCache.set(nb.pageId, { lastEditedTime: nb.lastEditedTime, buckets });
-        misses++;
-      }
-      for (const [num, { descriptor, text }] of Object.entries(buckets)) {
+      const { teamBuckets, hits, misses } = await fetchNotebookBuckets(client, nb.pageId);
+      totalHits += hits;
+      totalMisses += misses;
+      for (const [num, { descriptor, text, lastEditedTime }] of Object.entries(teamBuckets)) {
         if (descriptor && !teamDescriptors[num]) teamDescriptors[num] = descriptor;
         if (!reactions[num]) reactions[num] = {};
+        if (!reactionEdits[num]) reactionEdits[num] = {};
         reactions[num][nb.name] = text;
+        reactionEdits[num][nb.name] = lastEditedTime;
       }
     } catch (e) {
       const msg = String(e?.message || e);
@@ -272,8 +292,20 @@ export async function fetchAllReactions() {
     }
   });
 
-  if (misses > 0) {
-    console.log(`[notion] fetched ${notebooks.length} notebook(s): ${hits} cached, ${misses} refetched`);
+  // Sort each team's reactions by lastEditedTime descending (most recent first)
+  const orderedReactions = {};
+  for (const [num, byA] of Object.entries(reactions)) {
+    const sorted = Object.entries(byA).sort((a, b) => {
+      const ta = reactionEdits[num]?.[a[0]] || '';
+      const tb = reactionEdits[num]?.[b[0]] || '';
+      if (ta !== tb) return tb.localeCompare(ta);
+      return a[0].localeCompare(b[0]);
+    });
+    orderedReactions[num] = Object.fromEntries(sorted);
   }
-  return { reactions, teamDescriptors, errors };
+
+  if (totalMisses > 0 || totalHits === 0) {
+    console.log(`[notion] checked ${notebooks.length} notebook(s): ${totalHits} synced-blocks cached, ${totalMisses} refetched`);
+  }
+  return { reactions: orderedReactions, reactionEdits, teamDescriptors, errors };
 }
