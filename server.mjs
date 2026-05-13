@@ -133,6 +133,9 @@ async function main() {
   });
 
   app.get('/api/feedback', async (_req, res) => {
+    // Prevent any browser/proxy caching — stale data is the worst UX for a live view
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.set('Pragma', 'no-cache');
     const data = await getLiveData();
     // Pull the roster (auto-discovered when live, fallback for mock)
     let roster = [];

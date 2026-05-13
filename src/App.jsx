@@ -6,14 +6,17 @@ function useFeedback(intervalMs = 3000) {
   const [lastFetchedAt, setLastFetchedAt] = useState(null);
   const [error, setError] = useState(null);
   const mounted = useRef(true);
+  const tickRef = useRef(null);
+  const timerRef = useRef(null);
 
   useEffect(() => {
     mounted.current = true;
     let stopped = false;
-    let timer;
+
     async function tick() {
       try {
-        const res = await fetch('/api/feedback');
+        // Cache-bust at the URL level for paranoid proxies
+        const res = await fetch(`/api/feedback?t=${Date.now()}`, { cache: 'no-store' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
         if (!mounted.current) return;
@@ -24,14 +27,35 @@ function useFeedback(intervalMs = 3000) {
         if (!mounted.current) return;
         setError(String(e?.message || e));
       } finally {
-        if (!stopped) timer = setTimeout(tick, intervalMs);
+        if (!stopped) {
+          clearTimeout(timerRef.current);
+          timerRef.current = setTimeout(tick, intervalMs);
+        }
       }
     }
+    tickRef.current = tick;
     tick();
+
+    // Browsers throttle setTimeout to ≥60s in background tabs. Force a fresh
+    // fetch the moment the tab regains focus or visibility, so re-opening
+    // the tab shows current data immediately.
+    function onWake() {
+      if (document.visibilityState === 'visible' && tickRef.current) {
+        clearTimeout(timerRef.current);
+        tickRef.current();
+      }
+    }
+    document.addEventListener('visibilitychange', onWake);
+    window.addEventListener('focus', onWake);
+    window.addEventListener('online', onWake);
+
     return () => {
       stopped = true;
       mounted.current = false;
-      clearTimeout(timer);
+      clearTimeout(timerRef.current);
+      document.removeEventListener('visibilitychange', onWake);
+      window.removeEventListener('focus', onWake);
+      window.removeEventListener('online', onWake);
     };
   }, [intervalMs]);
 
