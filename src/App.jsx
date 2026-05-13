@@ -179,8 +179,22 @@ function TeamBlock({ team, byAttendee, notebookUrls, isFlashing, isCurrent }) {
   );
 }
 
+function formatRelativeTime(iso) {
+  if (!iso) return null;
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return null;
+  const s = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}
+
 function ByAttendeeView({ data, isFlashing }) {
-  const { reactions, teamDescriptors, notebookUrls } = data;
+  const { reactions, teamDescriptors, notebookUrls, roster = [] } = data;
   // Pivot reactions: byAttendee[name][teamNum] = markdown
   const pivot = {};
   for (const [num, byA] of Object.entries(reactions || {})) {
@@ -190,49 +204,87 @@ function ByAttendeeView({ data, isFlashing }) {
       pivot[name][num] = md;
     }
   }
-  const names = Object.keys(pivot).sort();
-  if (names.length === 0) {
+
+  // Build attendee list: roster (everyone discovered) + any contributors
+  // we have data for but who aren't in the roster (shouldn't happen, but safe)
+  const rosterByName = Object.fromEntries(roster.map((r) => [r.name, r]));
+  const allNames = new Set([...roster.map((r) => r.name), ...Object.keys(pivot)]);
+
+  // Sort: contributors first (by name), then non-contributors (by lastEditedTime desc)
+  const sorted = [...allNames].sort((a, b) => {
+    const aHas = !!pivot[a];
+    const bHas = !!pivot[b];
+    if (aHas !== bHas) return aHas ? -1 : 1;
+    if (aHas) return a.localeCompare(b);
+    // both no content: sort by recent edit
+    const at = rosterByName[a]?.lastEditedTime || '';
+    const bt = rosterByName[b]?.lastEditedTime || '';
+    if (at !== bt) return bt.localeCompare(at);
+    return a.localeCompare(b);
+  });
+
+  if (sorted.length === 0) {
     return (
       <div className="text-center py-16 text-ink-500 italic">
-        No reactions logged yet.
+        No attendees discovered yet. (Make sure their notebooks are subpages of the v5 hub.)
       </div>
     );
   }
+
+  const contributorCount = Object.keys(pivot).length;
+  const totalCount = sorted.length;
+
   return (
-    <div className="space-y-10">
-      {names.map((name) => {
-        const teams = Object.entries(pivot[name]).sort((a, b) => Number(a[0]) - Number(b[0]));
+    <div className="space-y-8">
+      <div className="text-[12px] font-mono text-ink-500">
+        {totalCount} attendee{totalCount === 1 ? '' : 's'} in roster · {contributorCount} contributing
+      </div>
+
+      {sorted.map((name) => {
+        const teams = pivot[name] ? Object.entries(pivot[name]).sort((a, b) => Number(a[0]) - Number(b[0])) : [];
+        const r = rosterByName[name];
+        const url = r?.url || notebookUrls?.[name];
+        const empty = teams.length === 0;
+        const lastEdit = formatRelativeTime(r?.lastEditedTime);
         return (
-          <section key={name}>
-            <header className="mb-3 flex items-baseline justify-between gap-3">
-              <h2 className="font-serif text-[24px] tracking-tight text-ink-900">{name}</h2>
-              {notebookUrls?.[name] && (
+          <section key={name} className={empty ? 'opacity-60' : ''}>
+            <header className="mb-3 flex items-baseline justify-between gap-3 flex-wrap">
+              <div className="flex items-baseline gap-3">
+                <h2 className="font-serif text-[22px] sm:text-[24px] tracking-tight text-ink-900">{name}</h2>
+                {empty && <span className="text-[11px] uppercase tracking-wider text-ink-500 font-mono">no reactions yet</span>}
+                {lastEdit && (
+                  <span className="text-[11px] text-ink-500 font-mono">edited {lastEdit}</span>
+                )}
+              </div>
+              {url && (
                 <a
-                  href={notebookUrls[name]}
+                  href={url}
                   target="_blank"
                   rel="noreferrer"
-                  className="text-[12px] text-ink-500 hover:text-amber-600 font-mono"
+                  className="text-[12px] text-ink-500 hover:text-amber-600 font-mono underline decoration-dotted underline-offset-2"
                 >
                   open notebook →
                 </a>
               )}
             </header>
-            <div className="space-y-3 border-l-2 border-ink-200 pl-5">
-              {teams.map(([num, md]) => {
-                const desc = teamDescriptors?.[num];
-                return (
-                  <div key={num} className={['card p-4', isFlashing(`${num}:${name}`) ? 'animate-flash-in' : ''].join(' ')}>
-                    <div className="text-[11px] uppercase tracking-wider text-ink-500 font-mono mb-1.5">
-                      On Team {num}
-                      {desc && <span className="ml-1 normal-case tracking-normal text-ink-500 italic"> · {desc}</span>}
+            {!empty && (
+              <div className="space-y-3 border-l-2 border-ink-200 pl-5">
+                {teams.map(([num, md]) => {
+                  const desc = teamDescriptors?.[num];
+                  return (
+                    <div key={num} className={['card p-4', isFlashing(`${num}:${name}`) ? 'animate-flash-in' : ''].join(' ')}>
+                      <div className="text-[11px] uppercase tracking-wider text-ink-500 font-mono mb-1.5">
+                        On Team {num}
+                        {desc && <span className="ml-1 normal-case tracking-normal text-ink-500 italic"> · {desc}</span>}
+                      </div>
+                      <div className="prose-reaction">
+                        <ReactMarkdown>{md}</ReactMarkdown>
+                      </div>
                     </div>
-                    <div className="prose-reaction">
-                      <ReactMarkdown>{md}</ReactMarkdown>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
         );
       })}
@@ -388,7 +440,7 @@ export default function App() {
               <h1 className="font-serif text-[28px] sm:text-[32px] tracking-tight leading-none text-ink-900">
                 Symposium <span className="italic text-ink-500">·</span> Live Reactions
               </h1>
-              <div className="mt-1 text-[12px] font-mono text-ink-500 flex flex-wrap gap-x-4 gap-y-1">
+              <div className="mt-1 text-[12px] font-mono text-ink-500 flex flex-wrap gap-x-4 gap-y-1 items-baseline">
                 <span>
                   <span className="text-ink-900 font-semibold">{teamsWithContent}</span>/18 teams with reactions
                 </span>
@@ -399,9 +451,35 @@ export default function App() {
                   {error ? `error: ${error}` : `refreshed ${age}`}
                 </span>
                 {data?.mode && (
-                  <span className={data.mode === 'notion' ? 'text-emerald-700' : 'text-amber-600'}>
-                    {data.mode === 'notion' ? 'live · notion' : data.mode === 'notion-error' ? 'notion error' : 'demo · mock'}
+                  <span
+                    className={
+                      data.stale
+                        ? 'text-amber-600'
+                        : data.mode === 'notion'
+                        ? 'text-emerald-700'
+                        : data.mode === 'notion-error'
+                        ? 'text-red-600'
+                        : 'text-amber-600'
+                    }
+                  >
+                    {data.stale
+                      ? 'stale (backoff)'
+                      : data.mode === 'notion'
+                      ? 'live · notion'
+                      : data.mode === 'notion-error'
+                      ? 'notion error'
+                      : 'demo · mock'}
                   </span>
+                )}
+                {data?.hubUrl && (
+                  <a
+                    href={data.hubUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-ink-500 hover:text-amber-600 underline decoration-dotted underline-offset-2"
+                  >
+                    ↗ open hub in Notion
+                  </a>
                 )}
               </div>
             </div>

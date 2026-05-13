@@ -31,46 +31,90 @@ async function pickPort() {
   return 7412;
 }
 
+const HUB_URL = 'https://www.notion.so/35ffda9cff6381f8ba77cd69b20e0982';
+
 const mockReactions = JSON.parse(JSON.stringify(SEED_REACTIONS));
 let currentlyPresenting = null;
 let lastNotionFetchAt = 0;
-let cachedNotion = null;
-const NOTION_TTL_MS = 2500;
+let nextNotionFetchAt = 0; // backoff target — don't hit Notion before this
+let cachedNotion = null; // last successful payload (keeps showing during transient failures)
+let lastError = null;
+const NOTION_TTL_MS = 4000;       // normal cache window
+const ERROR_BACKOFF_MS = 15_000;  // generic error backoff
+const RATE_LIMIT_BACKOFF_MS = 45_000; // longer when Notion explicitly rate-limits
 
 async function getLiveData() {
-  if (getNotion()) {
-    if (Date.now() - lastNotionFetchAt < NOTION_TTL_MS && cachedNotion) return cachedNotion;
-    try {
-      const { reactions, teamDescriptors, errors } = await fetchAllReactions();
-      cachedNotion = {
-        mode: 'notion',
-        reactions,
-        teamDescriptors,
-        errors,
-        notebookUrls: Object.fromEntries(getNotebooks().map((n) => [n.name, n.url])),
-        fetchedAt: Date.now(),
-      };
-      lastNotionFetchAt = Date.now();
-      return cachedNotion;
-    } catch (e) {
+  if (!getNotion()) {
+    return {
+      mode: 'mock',
+      reactions: mockReactions,
+      teamDescriptors: Object.fromEntries(TEAMS.filter((t) => t.descriptor).map((t) => [t.num, t.descriptor])),
+      notebookUrls: NOTEBOOK_URLS,
+      errors: [],
+      hubUrl: HUB_URL,
+      fetchedAt: Date.now(),
+    };
+  }
+
+  const now = Date.now();
+  const withinCache = now - lastNotionFetchAt < NOTION_TTL_MS && cachedNotion;
+  const inBackoff = now < nextNotionFetchAt;
+  if (withinCache || inBackoff) {
+    if (cachedNotion) {
+      // Surface the last error alongside the (possibly stale) data so UI can show it
       return {
-        mode: 'notion-error',
-        reactions: {},
-        teamDescriptors: {},
-        notebookUrls: {},
-        errors: [{ notebook: '*', error: String(e?.message || e) }],
-        fetchedAt: Date.now(),
+        ...cachedNotion,
+        errors: lastError ? [lastError, ...(cachedNotion.errors || [])] : (cachedNotion.errors || []),
+        stale: inBackoff && !withinCache,
       };
     }
+    // No cached data yet — return error envelope without retrying
+    return {
+      mode: 'notion-error',
+      reactions: {},
+      teamDescriptors: {},
+      notebookUrls: {},
+      errors: lastError ? [lastError] : [],
+      hubUrl: HUB_URL,
+      fetchedAt: Date.now(),
+    };
   }
-  return {
-    mode: 'mock',
-    reactions: mockReactions,
-    teamDescriptors: Object.fromEntries(TEAMS.filter((t) => t.descriptor).map((t) => [t.num, t.descriptor])),
-    notebookUrls: NOTEBOOK_URLS,
-    errors: [],
-    fetchedAt: Date.now(),
-  };
+
+  try {
+    const { reactions, teamDescriptors, errors } = await fetchAllReactions();
+    cachedNotion = {
+      mode: 'notion',
+      reactions,
+      teamDescriptors,
+      errors,
+      notebookUrls: Object.fromEntries(getNotebooks().map((n) => [n.name, n.url])),
+      hubUrl: HUB_URL,
+      fetchedAt: Date.now(),
+    };
+    lastNotionFetchAt = Date.now();
+    lastError = null;
+    nextNotionFetchAt = 0;
+    return cachedNotion;
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const isRateLimit = /rate limit/i.test(msg);
+    lastError = { notebook: '*', error: msg, at: Date.now() };
+    nextNotionFetchAt = Date.now() + (isRateLimit ? RATE_LIMIT_BACKOFF_MS : ERROR_BACKOFF_MS);
+    console.error(`[notion] fetch failed (backoff ${isRateLimit ? RATE_LIMIT_BACKOFF_MS : ERROR_BACKOFF_MS}ms): ${msg}`);
+    // If we have prior data, keep showing it
+    if (cachedNotion) {
+      return { ...cachedNotion, errors: [lastError, ...(cachedNotion.errors || [])], stale: true };
+    }
+    return {
+      mode: 'notion-error',
+      reactions: {},
+      teamDescriptors: {},
+      notebookUrls: {},
+      errors: [lastError],
+      hubUrl: HUB_URL,
+      fetchedAt: Date.now(),
+    };
+  }
 }
 
 async function main() {
@@ -83,7 +127,22 @@ async function main() {
 
   app.get('/api/feedback', async (_req, res) => {
     const data = await getLiveData();
-    res.json({ ...data, attendees: ATTENDEES, currentlyPresenting });
+    // Pull the roster (auto-discovered when live, fallback for mock)
+    let roster = [];
+    if (getNotion()) {
+      roster = getNotebooks().map((n) => ({
+        name: n.name,
+        url: n.url,
+        lastEditedTime: n.lastEditedTime || null,
+      }));
+    } else {
+      roster = ATTENDEES.slice(0, 5).map((name) => ({
+        name,
+        url: data.notebookUrls?.[name] || null,
+        lastEditedTime: null,
+      }));
+    }
+    res.json({ ...data, attendees: ATTENDEES, roster, hubUrl: data.hubUrl || HUB_URL, currentlyPresenting });
   });
 
   app.post('/api/feedback', (req, res) => {
