@@ -1,15 +1,17 @@
 // Server-side Notion fetcher.
 // Reads notebook pages, walks blocks, groups by Team N heading.
+//
+// Notebooks are AUTO-DISCOVERED via Notion search rather than hardcoded.
+// Filter: pages whose parent is the v5 hub AND title looks like an attendee
+// notebook (starts with 📓 or contains "notebook"). New attendees show up
+// in the app within ~60s of being created in Notion — no config changes.
 
 import { Client } from '@notionhq/client';
 
-const NOTEBOOKS = [
-  { name: 'Jacob Cole',    pageId: '35ffda9cff63811eb82bf770c2258056', url: 'https://www.notion.so/35ffda9cff63811eb82bf770c2258056' },
-  { name: 'Hanan Sinada',  pageId: '35ffda9cff63816c8da2df8c413b8cc7', url: 'https://www.notion.so/35ffda9cff63816c8da2df8c413b8cc7' },
-  { name: 'Pete Kane',     pageId: '35ffda9cff6381a2b43bf6e6a6fc8f7f', url: 'https://www.notion.so/35ffda9cff6381a2b43bf6e6a6fc8f7f' },
-  { name: 'Pete K.',       pageId: '35ffda9cff6381fbb7a5de60bab2585f', url: 'https://www.notion.so/35ffda9cff6381fbb7a5de60bab2585f' },
-  { name: 'Sarah L.',      pageId: '35ffda9cff6381e3a45fc81e15175d88', url: 'https://www.notion.so/35ffda9cff6381e3a45fc81e15175d88' },
-];
+const HUB_PAGE_ID_NO_DASHES = '35ffda9cff6381f8ba77cd69b20e0982';
+// Notion API responds with dashed UUIDs in `parent.page_id`; compare normalized.
+const HUB_PAGE_ID_NORM = HUB_PAGE_ID_NO_DASHES.replace(/-/g, '').toLowerCase();
+const NOTEBOOK_DISCOVERY_TTL_MS = 60_000;
 
 let notion = null;
 export function getNotion() {
@@ -20,8 +22,82 @@ export function getNotion() {
   return notion;
 }
 
+function extractTitle(page) {
+  const titleProp = page?.properties?.title || page?.properties?.Name;
+  const arr = titleProp?.title || [];
+  return arr.map((t) => t.plain_text).join('').trim();
+}
+
+// Strip leading emoji + "📓 " and trailing " — notebook" / " - notebook"
+function attendeeNameFromTitle(title) {
+  let s = title.trim();
+  // Strip leading emoji (anything before first letter/space)
+  s = s.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+  // Strip "— notebook" suffix with various dashes
+  s = s.replace(/\s*[—–\-]\s*notebook\s*$/i, '').trim();
+  return s;
+}
+
+function looksLikeNotebook(title) {
+  if (!title) return false;
+  const t = title.toLowerCase();
+  if (t.startsWith('📓')) return true;
+  if (/\bnotebook\b/i.test(t)) return true;
+  return false;
+}
+
+let notebookCache = { at: 0, list: [] };
+
+export async function discoverNotebooks() {
+  const client = getNotion();
+  if (!client) return [];
+  if (Date.now() - notebookCache.at < NOTEBOOK_DISCOVERY_TTL_MS && notebookCache.list.length) {
+    return notebookCache.list;
+  }
+
+  const results = [];
+  let cursor;
+  do {
+    const res = await client.search({
+      filter: { value: 'page', property: 'object' },
+      page_size: 100,
+      start_cursor: cursor,
+    });
+    results.push(...res.results);
+    cursor = res.has_more ? res.next_cursor : undefined;
+  } while (cursor);
+
+  const notebooks = [];
+  for (const p of results) {
+    if (p.object !== 'page') continue;
+    const parentId = (p.parent?.page_id || '').replace(/-/g, '').toLowerCase();
+    if (parentId !== HUB_PAGE_ID_NORM) continue;
+    const title = extractTitle(p);
+    if (!looksLikeNotebook(title)) continue;
+    notebooks.push({
+      name: attendeeNameFromTitle(title) || title || p.id,
+      pageId: p.id,
+      url: p.url || `https://www.notion.so/${p.id.replace(/-/g, '')}`,
+      lastEditedTime: p.last_edited_time,
+    });
+  }
+  // Stable order: by last_edited_time desc (most active first), tiebreak by name
+  notebooks.sort((a, b) => {
+    if (a.lastEditedTime && b.lastEditedTime && a.lastEditedTime !== b.lastEditedTime) {
+      return b.lastEditedTime.localeCompare(a.lastEditedTime);
+    }
+    return a.name.localeCompare(b.name);
+  });
+
+  notebookCache = { at: Date.now(), list: notebooks };
+  console.log(`[notion] discovered ${notebooks.length} attendee notebook(s):`, notebooks.map((n) => n.name).join(', '));
+  return notebooks;
+}
+
+// Kept for backwards compat with callers that need a list. May return a stale
+// cache or empty array if discovery has not been called yet.
 export function getNotebooks() {
-  return NOTEBOOKS;
+  return notebookCache.list;
 }
 
 // Pull a flat array of richtext-bearing blocks from a page (including
@@ -142,12 +218,13 @@ export async function fetchAllReactions() {
   const client = getNotion();
   if (!client) throw new Error('NOTION_TOKEN not set');
 
+  const notebooks = await discoverNotebooks();
   const reactions = {};
   const teamDescriptors = {};
   const errors = [];
 
   await Promise.all(
-    NOTEBOOKS.map(async (nb) => {
+    notebooks.map(async (nb) => {
       try {
         const blocks = await listAllBlocks(client, nb.pageId);
         const buckets = bucketByTeam(blocks);
@@ -157,7 +234,9 @@ export async function fetchAllReactions() {
           reactions[num][nb.name] = text;
         }
       } catch (e) {
-        errors.push({ notebook: nb.name, error: String(e?.message || e) });
+        const msg = String(e?.message || e);
+        errors.push({ notebook: nb.name, error: msg });
+        console.error(`[notion] ${nb.name} (${nb.pageId}): ${msg}`);
       }
     })
   );
