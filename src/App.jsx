@@ -1,0 +1,469 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+
+function useFeedback(intervalMs = 3000) {
+  const [data, setData] = useState(null);
+  const [lastFetchedAt, setLastFetchedAt] = useState(null);
+  const [error, setError] = useState(null);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    let stopped = false;
+    let timer;
+    async function tick() {
+      try {
+        const res = await fetch('/api/feedback');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        if (!mounted.current) return;
+        setData(json);
+        setLastFetchedAt(Date.now());
+        setError(null);
+      } catch (e) {
+        if (!mounted.current) return;
+        setError(String(e?.message || e));
+      } finally {
+        if (!stopped) timer = setTimeout(tick, intervalMs);
+      }
+    }
+    tick();
+    return () => {
+      stopped = true;
+      mounted.current = false;
+      clearTimeout(timer);
+    };
+  }, [intervalMs]);
+
+  return { data, lastFetchedAt, error };
+}
+
+function useAge(ts) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+  if (!ts) return '—';
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 2) return 'just now';
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${s - m * 60}s ago`;
+}
+
+// Track which (team, attendee) entries are "new" since last seen → flash them
+function useFlashTracker(reactionsByTeam) {
+  const seen = useRef(new Map()); // key = `${num}:${attendee}` → markdown
+  const flashing = useRef(new Set());
+  const [, setTick] = useState(0);
+
+  useEffect(() => {
+    if (!reactionsByTeam) return;
+    const next = new Map();
+    let anyNew = false;
+    for (const [num, byA] of Object.entries(reactionsByTeam)) {
+      for (const [attendee, md] of Object.entries(byA)) {
+        const key = `${num}:${attendee}`;
+        next.set(key, md);
+        const prev = seen.current.get(key);
+        if (prev === undefined) {
+          // Only flash on subsequent fetches — not the initial paint
+          if (seen.current.size > 0) {
+            flashing.current.add(key);
+            anyNew = true;
+            setTimeout(() => {
+              flashing.current.delete(key);
+              setTick((t) => t + 1);
+            }, 1800);
+          }
+        } else if (prev !== md) {
+          flashing.current.add(key);
+          anyNew = true;
+          setTimeout(() => {
+            flashing.current.delete(key);
+            setTick((t) => t + 1);
+          }, 1800);
+        }
+      }
+    }
+    seen.current = next;
+    if (anyNew) setTick((t) => t + 1);
+  }, [reactionsByTeam]);
+
+  return (key) => flashing.current.has(key);
+}
+
+function TeamBlock({ team, byAttendee, notebookUrls, isFlashing, isCurrent }) {
+  const entries = byAttendee ? Object.entries(byAttendee).filter(([, md]) => md && md.trim()) : [];
+  const empty = entries.length === 0;
+  return (
+    <section
+      id={`team-${team.num}`}
+      className={[
+        'mb-8 scroll-mt-24',
+        isCurrent ? 'rounded-2xl ring-2 ring-amber-400 ring-offset-4 ring-offset-ink-50 bg-amber-50/40 p-4 -mx-4' : '',
+      ].join(' ')}
+    >
+      <header className="flex items-baseline justify-between gap-4 mb-3">
+        <div className="flex items-baseline gap-3">
+          <span
+            className={[
+              'inline-flex items-center justify-center w-8 h-8 rounded-full text-[13px] font-mono font-semibold shrink-0',
+              empty
+                ? 'bg-ink-100 text-ink-500'
+                : 'bg-ink-900 text-ink-50',
+              isCurrent ? 'ring-2 ring-amber-400 animate-soft-pulse' : '',
+            ].join(' ')}
+          >
+            {team.num}
+          </span>
+          <h2 className="font-serif text-[22px] sm:text-[26px] tracking-tight text-ink-900">
+            Team {team.num}
+            {team.descriptor && (
+              <span className="ml-2 text-ink-500 italic font-serif text-[18px] sm:text-[20px]">
+                — {team.descriptor}
+              </span>
+            )}
+          </h2>
+        </div>
+        <div className="text-[11px] uppercase tracking-wider text-ink-500 font-mono shrink-0 hidden sm:block">
+          {empty ? 'no reactions yet' : `${entries.length} ${entries.length === 1 ? 'reaction' : 'reactions'}`}
+        </div>
+      </header>
+
+      {empty ? (
+        <div className="text-[13px] text-ink-500 italic pl-11">
+          No reactions yet — waiting on attendees{isCurrent ? '. (Currently presenting)' : '.'}
+        </div>
+      ) : (
+        <div className="space-y-3 pl-11">
+          {entries.map(([attendee, md]) => {
+            const flashKey = `${team.num}:${attendee}`;
+            const flash = isFlashing(flashKey);
+            const url = notebookUrls?.[attendee];
+            return (
+              <article
+                key={attendee}
+                className={['card p-4', flash ? 'animate-flash-in' : ''].join(' ')}
+              >
+                <div className="flex items-baseline justify-between gap-3 mb-1.5">
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-semibold text-ink-900">{attendee}</span>
+                    {flash && (
+                      <span className="text-[10px] uppercase tracking-widest text-amber-600 font-mono">
+                        just added
+                      </span>
+                    )}
+                  </div>
+                  {url && (
+                    <a
+                      href={url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-[11px] text-ink-500 hover:text-amber-600 font-mono underline decoration-dotted underline-offset-2"
+                    >
+                      open notebook →
+                    </a>
+                  )}
+                </div>
+                <div className="prose-reaction">
+                  <ReactMarkdown>{md}</ReactMarkdown>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ByAttendeeView({ data, isFlashing }) {
+  const { reactions, teamDescriptors, notebookUrls } = data;
+  // Pivot reactions: byAttendee[name][teamNum] = markdown
+  const pivot = {};
+  for (const [num, byA] of Object.entries(reactions || {})) {
+    for (const [name, md] of Object.entries(byA)) {
+      if (!md || !md.trim()) continue;
+      if (!pivot[name]) pivot[name] = {};
+      pivot[name][num] = md;
+    }
+  }
+  const names = Object.keys(pivot).sort();
+  if (names.length === 0) {
+    return (
+      <div className="text-center py-16 text-ink-500 italic">
+        No reactions logged yet.
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-10">
+      {names.map((name) => {
+        const teams = Object.entries(pivot[name]).sort((a, b) => Number(a[0]) - Number(b[0]));
+        return (
+          <section key={name}>
+            <header className="mb-3 flex items-baseline justify-between gap-3">
+              <h2 className="font-serif text-[24px] tracking-tight text-ink-900">{name}</h2>
+              {notebookUrls?.[name] && (
+                <a
+                  href={notebookUrls[name]}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[12px] text-ink-500 hover:text-amber-600 font-mono"
+                >
+                  open notebook →
+                </a>
+              )}
+            </header>
+            <div className="space-y-3 border-l-2 border-ink-200 pl-5">
+              {teams.map(([num, md]) => {
+                const desc = teamDescriptors?.[num];
+                return (
+                  <div key={num} className={['card p-4', isFlashing(`${num}:${name}`) ? 'animate-flash-in' : ''].join(' ')}>
+                    <div className="text-[11px] uppercase tracking-wider text-ink-500 font-mono mb-1.5">
+                      On Team {num}
+                      {desc && <span className="ml-1 normal-case tracking-normal text-ink-500 italic"> · {desc}</span>}
+                    </div>
+                    <div className="prose-reaction">
+                      <ReactMarkdown>{md}</ReactMarkdown>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+function PresentingPicker({ teams, current, onChange }) {
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <span className="text-[11px] uppercase tracking-wider text-ink-500 font-mono mr-1">presenting:</span>
+      <button
+        onClick={() => onChange(null)}
+        className={[
+          'text-[12px] px-2 py-1 rounded font-mono border',
+          current == null
+            ? 'bg-ink-900 text-ink-50 border-ink-900'
+            : 'bg-white text-ink-500 border-ink-200 hover:border-ink-500',
+        ].join(' ')}
+      >
+        none
+      </button>
+      {teams.map((t) => (
+        <button
+          key={t.num}
+          onClick={() => onChange(t.num)}
+          className={[
+            'text-[12px] w-7 h-7 rounded font-mono border',
+            current === t.num
+              ? 'bg-amber-500 text-white border-amber-500'
+              : 'bg-white text-ink-700 border-ink-200 hover:border-amber-400',
+          ].join(' ')}
+        >
+          {t.num}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function MockAdder({ data, onAdded }) {
+  const [team, setTeam] = useState('5');
+  const [attendee, setAttendee] = useState('');
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  if (data?.mode !== 'mock') return null;
+  const attendees = data.attendees || [];
+  return (
+    <div className="card p-3 mt-4 text-[13px]">
+      <div className="text-[11px] uppercase tracking-wider text-ink-500 font-mono mb-2">
+        Demo: add a mock reaction (mock mode only)
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-[80px_180px_1fr_auto] gap-2 items-start">
+        <input
+          value={team}
+          onChange={(e) => setTeam(e.target.value)}
+          placeholder="Team #"
+          className="border border-ink-200 rounded px-2 py-1 font-mono text-[13px]"
+        />
+        <select
+          value={attendee}
+          onChange={(e) => setAttendee(e.target.value)}
+          className="border border-ink-200 rounded px-2 py-1 text-[13px]"
+        >
+          <option value="">— attendee —</option>
+          {attendees.map((a) => (
+            <option key={a} value={a}>{a}</option>
+          ))}
+        </select>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Reaction (markdown OK)"
+          rows={1}
+          className="border border-ink-200 rounded px-2 py-1 text-[13px] min-h-[32px]"
+        />
+        <button
+          disabled={busy || !team || !attendee || !text}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              await fetch('/api/feedback', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ team: Number(team), attendee, text }),
+              });
+              setText('');
+              onAdded?.();
+            } finally {
+              setBusy(false);
+            }
+          }}
+          className="bg-ink-900 text-ink-50 rounded px-3 py-1 text-[13px] disabled:opacity-40"
+        >
+          Add
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const { data, lastFetchedAt, error } = useFeedback(3000);
+  const age = useAge(lastFetchedAt);
+  const isFlashing = useFlashTracker(data?.reactions);
+  const [view, setView] = useState('by-talk'); // 'by-talk' | 'by-attendee'
+
+  // Stitch team list with live descriptors taking precedence over mock
+  const teamsForView = useMemo(() => {
+    if (!data) return [];
+    const known = data.teamDescriptors || {};
+    // Always show all 18 in order
+    return Array.from({ length: 18 }, (_, i) => {
+      const num = i + 1;
+      return { num, descriptor: known[num] || null };
+    });
+  }, [data]);
+
+  const teamsWithContent = useMemo(() => {
+    if (!data?.reactions) return 0;
+    let n = 0;
+    for (const byA of Object.values(data.reactions)) {
+      if (Object.values(byA).some((md) => md && md.trim())) n++;
+    }
+    return n;
+  }, [data]);
+
+  const contributors = useMemo(() => {
+    if (!data?.reactions) return 0;
+    const set = new Set();
+    for (const byA of Object.values(data.reactions)) {
+      for (const [name, md] of Object.entries(byA)) {
+        if (md && md.trim()) set.add(name);
+      }
+    }
+    return set.size;
+  }, [data]);
+
+  const setPresenting = async (num) => {
+    await fetch('/api/presenting', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ num }),
+    });
+  };
+
+  return (
+    <div className="min-h-screen">
+      <header className="sticky top-0 z-10 backdrop-blur-md bg-ink-50/80 border-b border-ink-200/60">
+        <div className="max-w-4xl mx-auto px-4 sm:px-6 py-3">
+          <div className="flex items-baseline justify-between gap-4 flex-wrap">
+            <div>
+              <h1 className="font-serif text-[28px] sm:text-[32px] tracking-tight leading-none text-ink-900">
+                Symposium <span className="italic text-ink-500">·</span> Live Reactions
+              </h1>
+              <div className="mt-1 text-[12px] font-mono text-ink-500 flex flex-wrap gap-x-4 gap-y-1">
+                <span>
+                  <span className="text-ink-900 font-semibold">{teamsWithContent}</span>/18 teams with reactions
+                </span>
+                <span>
+                  <span className="text-ink-900 font-semibold">{contributors}</span> contributing
+                </span>
+                <span className={error ? 'text-red-600' : ''}>
+                  {error ? `error: ${error}` : `refreshed ${age}`}
+                </span>
+                {data?.mode && (
+                  <span className={data.mode === 'notion' ? 'text-emerald-700' : 'text-amber-600'}>
+                    {data.mode === 'notion' ? 'live · notion' : data.mode === 'notion-error' ? 'notion error' : 'demo · mock'}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-1 text-[12px] font-mono">
+              <button
+                onClick={() => setView('by-talk')}
+                className={[
+                  'px-2.5 py-1 rounded',
+                  view === 'by-talk' ? 'bg-ink-900 text-ink-50' : 'text-ink-500 hover:text-ink-900',
+                ].join(' ')}
+              >
+                by talk
+              </button>
+              <button
+                onClick={() => setView('by-attendee')}
+                className={[
+                  'px-2.5 py-1 rounded',
+                  view === 'by-attendee' ? 'bg-ink-900 text-ink-50' : 'text-ink-500 hover:text-ink-900',
+                ].join(' ')}
+              >
+                by attendee
+              </button>
+            </div>
+          </div>
+          <div className="mt-3">
+            <PresentingPicker teams={teamsForView} current={data?.currentlyPresenting ?? null} onChange={setPresenting} />
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-4xl mx-auto px-4 sm:px-6 py-6">
+        {!data ? (
+          <div className="text-center py-24 text-ink-500 italic font-serif text-xl">loading…</div>
+        ) : view === 'by-talk' ? (
+          <>
+            {teamsForView.map((team) => (
+              <TeamBlock
+                key={team.num}
+                team={team}
+                byAttendee={data.reactions?.[team.num]}
+                notebookUrls={data.notebookUrls}
+                isFlashing={isFlashing}
+                isCurrent={data.currentlyPresenting === team.num}
+              />
+            ))}
+            <MockAdder data={data} />
+          </>
+        ) : (
+          <ByAttendeeView data={data} isFlashing={isFlashing} />
+        )}
+
+        {data?.errors?.length > 0 && (
+          <details className="mt-8 text-[12px] text-red-700 font-mono">
+            <summary>Notion errors ({data.errors.length})</summary>
+            <pre className="whitespace-pre-wrap mt-2">{JSON.stringify(data.errors, null, 2)}</pre>
+          </details>
+        )}
+
+        <footer className="mt-12 pb-12 text-center text-[11px] text-ink-500 font-mono">
+          Reading from {data?.mode === 'notion' ? 'Notion' : 'mock data'} · polls every 3s · empty teams hidden
+        </footer>
+      </main>
+    </div>
+  );
+}
