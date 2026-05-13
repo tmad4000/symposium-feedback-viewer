@@ -516,6 +516,35 @@ export default function App() {
               </button>
             </div>
           </div>
+          {data?.roster?.length > 0 && (
+            <div className="mt-2 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[12px] font-mono">
+              <span className="text-ink-500 uppercase tracking-wider mr-1">roster:</span>
+              {data.roster.map((r, i) => {
+                const hasReactions = !!data.reactions && Object.values(data.reactions).some((byA) => byA[r.name] && byA[r.name].trim());
+                return (
+                  <React.Fragment key={r.name}>
+                    {i > 0 && <span className="text-ink-300">·</span>}
+                    <a
+                      href={r.url || '#'}
+                      target="_blank"
+                      rel="noreferrer"
+                      className={[
+                        'hover:text-amber-600 transition-colors',
+                        hasReactions ? 'text-ink-900 font-semibold' : 'text-ink-500',
+                      ].join(' ')}
+                      title={hasReactions ? 'has reactions — click to open in Notion' : 'no reactions yet — click to open in Notion'}
+                    >
+                      {r.name}
+                      {hasReactions && <span className="ml-0.5 text-amber-500">●</span>}
+                    </a>
+                  </React.Fragment>
+                );
+              })}
+              <span className="text-ink-300 ml-1">
+                {data.roster.length === 1 ? '(1 notebook)' : `(${data.roster.length} notebooks)`}
+              </span>
+            </div>
+          )}
           <div className="mt-3">
             <PresentingPicker teams={teamsForView} current={data?.currentlyPresenting ?? null} onChange={setPresenting} />
           </div>
@@ -527,6 +556,17 @@ export default function App() {
           <div className="text-center py-24 text-ink-500 italic font-serif text-xl">loading…</div>
         ) : view === 'by-talk' ? (
           <>
+            {teamsWithContent === 0 && data?.mode === 'notion' && (
+              <div className="card p-5 mb-8 text-[14px] text-ink-700">
+                <div className="font-serif text-[18px] text-ink-900 mb-1">Waiting for the first reaction.</div>
+                <p className="text-ink-500 leading-relaxed">
+                  {data?.roster?.length || 0} notebook{data?.roster?.length === 1 ? '' : 's'} discovered.
+                  Seed text (<code className="px-1 bg-ink-100 rounded">(your reactions here)</code>) is filtered
+                  out — so this view stays empty until an attendee types real content into a synced block.
+                  Reactions appear here within ~5s of being typed in Notion.
+                </p>
+              </div>
+            )}
             {teamsForView.map((team) => (
               <TeamBlock
                 key={team.num}
