@@ -471,14 +471,26 @@ export default function App() {
                       : 'demo · mock'}
                   </span>
                 )}
+                {data?.masterViewUrl && (
+                  <a
+                    href={data.masterViewUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-ink-500 hover:text-amber-600 underline decoration-dotted underline-offset-2"
+                    title="Notion's master by-talk page (where all synced blocks aggregate)"
+                  >
+                    ↗ master view in Notion
+                  </a>
+                )}
                 {data?.hubUrl && (
                   <a
                     href={data.hubUrl}
                     target="_blank"
                     rel="noreferrer"
                     className="text-ink-500 hover:text-amber-600 underline decoration-dotted underline-offset-2"
+                    title="The v5 hub — parent of all attendee notebooks"
                   >
-                    ↗ open hub in Notion
+                    ↗ hub
                   </a>
                 )}
               </div>

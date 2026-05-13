@@ -31,6 +31,9 @@ async function pickPort() {
   return 7412;
 }
 
+// The page someone actually wants to read in Notion is the master by-talk
+// page (where all synced blocks aggregate), NOT the structural hub.
+const MASTER_VIEW_URL = 'https://www.notion.so/35ffda9cff6381d39733d791f19daf54';
 const HUB_URL = 'https://www.notion.so/35ffda9cff6381f8ba77cd69b20e0982';
 
 const mockReactions = JSON.parse(JSON.stringify(SEED_REACTIONS));
@@ -52,6 +55,7 @@ async function getLiveData() {
       notebookUrls: NOTEBOOK_URLS,
       errors: [],
       hubUrl: HUB_URL,
+      masterViewUrl: MASTER_VIEW_URL,
       fetchedAt: Date.now(),
     };
   }
@@ -76,6 +80,7 @@ async function getLiveData() {
       notebookUrls: {},
       errors: lastError ? [lastError] : [],
       hubUrl: HUB_URL,
+      masterViewUrl: MASTER_VIEW_URL,
       fetchedAt: Date.now(),
     };
   }
@@ -89,6 +94,7 @@ async function getLiveData() {
       errors,
       notebookUrls: Object.fromEntries(getNotebooks().map((n) => [n.name, n.url])),
       hubUrl: HUB_URL,
+      masterViewUrl: MASTER_VIEW_URL,
       fetchedAt: Date.now(),
     };
     lastNotionFetchAt = Date.now();
@@ -112,6 +118,7 @@ async function getLiveData() {
       notebookUrls: {},
       errors: [lastError],
       hubUrl: HUB_URL,
+      masterViewUrl: MASTER_VIEW_URL,
       fetchedAt: Date.now(),
     };
   }
@@ -142,7 +149,14 @@ async function main() {
         lastEditedTime: null,
       }));
     }
-    res.json({ ...data, attendees: ATTENDEES, roster, hubUrl: data.hubUrl || HUB_URL, currentlyPresenting });
+    res.json({
+      ...data,
+      attendees: ATTENDEES,
+      roster,
+      hubUrl: data.hubUrl || HUB_URL,
+      masterViewUrl: data.masterViewUrl || MASTER_VIEW_URL,
+      currentlyPresenting,
+    });
   });
 
   app.post('/api/feedback', (req, res) => {
