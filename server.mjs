@@ -378,6 +378,19 @@ async function main() {
     const mode = getNotion() ? 'NOTION (live)' : 'MOCK (no NOTION_TOKEN found)';
     console.log(`[symposium-viewer] listening on 127.0.0.1:${port} — mode: ${mode}`);
   });
+
+  // Background warmer: keep the cache hot 24/7 so the FIRST visitor after a
+  // restart doesn't pay the ~18s cold-fetch tax. Refresh slightly faster than
+  // server TTL so cachedNotion is always populated when a client hits us.
+  if (getNotion()) {
+    const WARM_INTERVAL_MS = 5000;
+    setInterval(() => {
+      getLiveData().catch((e) => console.error('[warmer]', e?.message || e));
+    }, WARM_INTERVAL_MS);
+    // Fire one immediately at startup so we're hot ASAP
+    getLiveData().catch((e) => console.error('[warmer:initial]', e?.message || e));
+    console.log('[warmer] background cache refresh every 5s enabled');
+  }
 }
 
 main().catch((e) => {
