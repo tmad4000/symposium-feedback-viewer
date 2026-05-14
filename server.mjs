@@ -44,6 +44,8 @@ let lastNotionFetchAt = 0;
 let nextNotionFetchAt = 0; // backoff target — don't hit Notion before this
 let cachedNotion = null; // last successful payload (keeps showing during transient failures)
 let lastError = null;
+let inFlightFetch = null; // dedup concurrent fetches — when SSE pushes to N
+                          // clients, only one hits Notion; the rest await
 const NOTION_TTL_MS = 4000;       // normal cache window
 const ERROR_BACKOFF_MS = 15_000;  // generic error backoff
 const RATE_LIMIT_BACKOFF_MS = 45_000; // longer when Notion explicitly rate-limits
@@ -87,6 +89,13 @@ async function getLiveData() {
     };
   }
 
+  // Dedup: if another request is already fetching from Notion, await that one
+  if (inFlightFetch) return inFlightFetch;
+  inFlightFetch = doFreshFetch().finally(() => { inFlightFetch = null; });
+  return inFlightFetch;
+}
+
+async function doFreshFetch() {
   try {
     const { reactions, teamDescriptors, errors, newestEdit } = await fetchAllReactions();
     cachedNotion = {
@@ -142,14 +151,25 @@ function broadcastUpdate(reason = 'update') {
   }
 }
 
+// Clears BOTH the low-level Notion caches (in notion.js) AND the server's
+// response cache (cachedNotion + lastNotionFetchAt). Without invalidating
+// the server response cache, the webhook's freshness gets eaten by our
+// own 4s response TTL — clients see stale data for up to 4s after each
+// edit even though the webhook arrived in <100ms.
+function fullInvalidate() {
+  invalidateCaches();         // notebook discovery cache + synced_block cache
+  cachedNotion = null;        // server's last-good response
+  lastNotionFetchAt = 0;      // server's response TTL check
+}
+
 let invalidateDebounce = null;
 function debouncedInvalidate(reason) {
   if (invalidateDebounce) return;
   invalidateDebounce = setTimeout(() => {
     invalidateDebounce = null;
-    invalidateCaches();
+    fullInvalidate();
     broadcastUpdate(reason);
-  }, 800);
+  }, 600); // 600ms collapses bursts of edits into one refresh
 }
 
 async function main() {
