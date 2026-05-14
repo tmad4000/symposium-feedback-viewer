@@ -6,7 +6,9 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
-import { fetchAllReactions, getNotion, getNotebooks, claimPlaceholder } from './src/notion.js';
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import { fetchAllReactions, getNotion, getNotebooks, createAttendeeNotebook, purgeBrokenPlaceholders, invalidateCaches } from './src/notion.js';
 import { SEED_REACTIONS, NOTEBOOK_URLS, TEAMS, ATTENDEES } from './src/mockData.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -124,9 +126,40 @@ async function getLiveData() {
   }
 }
 
+// ---------- SSE + webhook state ----------
+const sseClients = new Set();
+let webhookSecret = process.env.NOTION_WEBHOOK_SECRET || null;
+const WEBHOOK_SECRET_FILE = path.join(__dirname, '.webhook-secret');
+try {
+  if (!webhookSecret) webhookSecret = (await fs.readFile(WEBHOOK_SECRET_FILE, 'utf-8')).trim() || null;
+} catch {}
+
+function broadcastUpdate(reason = 'update') {
+  const payload = `event: update\ndata: ${JSON.stringify({ at: Date.now(), reason })}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(payload); } catch { sseClients.delete(res); }
+  }
+}
+
+let invalidateDebounce = null;
+function debouncedInvalidate(reason) {
+  if (invalidateDebounce) return;
+  invalidateDebounce = setTimeout(() => {
+    invalidateDebounce = null;
+    invalidateCaches();
+    broadcastUpdate(reason);
+  }, 800);
+}
+
 async function main() {
   const app = express();
-  app.use(express.json({ limit: '256kb' }));
+  // Capture raw body for the webhook route (needed for HMAC verification).
+  // All other routes get parsed JSON.
+  app.use((req, res, next) => {
+    if (req.path === '/api/notion-webhook') return next();
+    express.json({ limit: '256kb' })(req, res, next);
+  });
+  app.use('/api/notion-webhook', express.raw({ type: '*/*', limit: '1mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, mode: getNotion() ? 'notion' : 'mock' });
@@ -171,24 +204,104 @@ async function main() {
     res.json({ ok: true });
   });
 
-  // Claim a placeholder notebook and rename it for a new attendee.
-  // POST { name } -> { url, previousName, newName }  (or 503 if no placeholders left)
+  // Create a brand-new attendee notebook from scratch.
+  // POST { name } -> { name, url, pageId }
   app.post('/api/add-attendee', async (req, res) => {
     if (!getNotion()) return res.status(400).json({ error: 'Live Notion mode required' });
     const name = (req.body?.name || '').trim();
     if (!name) return res.status(400).json({ error: 'name required' });
     if (name.length > 80) return res.status(400).json({ error: 'name too long (max 80 chars)' });
     try {
-      const claimed = await claimPlaceholder(name);
-      if (!claimed) {
-        return res.status(503).json({ error: 'No placeholder notebooks left — Duplicate one manually in Notion.' });
-      }
-      console.log(`[add-attendee] ${claimed.previousName} → ${claimed.newName}`);
-      res.json(claimed);
+      // Pass team descriptors from the latest fetched payload (so new notebooks
+      // get the same "Team 3 — Pete's group" headings the existing ones have)
+      const teamDescriptors = cachedNotion?.teamDescriptors || {};
+      const created = await createAttendeeNotebook(name, teamDescriptors);
+      console.log(`[add-attendee] created: ${created.name} (${created.pageId})`);
+      res.json(created);
     } catch (e) {
       console.error('[add-attendee]', e?.message || e);
       res.status(500).json({ error: String(e?.message || e) });
     }
+  });
+
+  // One-shot cleanup endpoint for the broken bulk-duplicate placeholders.
+  // POST /api/purge-placeholders -> { deleted }
+  app.post('/api/purge-placeholders', async (_req, res) => {
+    if (!getNotion()) return res.status(400).json({ error: 'Live Notion mode required' });
+    try {
+      const count = await purgeBrokenPlaceholders();
+      invalidateCaches();
+      console.log(`[purge] deleted ${count} placeholder notebooks`);
+      res.json({ deleted: count });
+    } catch (e) {
+      console.error('[purge]', e?.message || e);
+      res.status(500).json({ error: String(e?.message || e) });
+    }
+  });
+
+  // ---------- SSE: clients subscribe here, server pushes "update" events
+  // whenever Notion content changes (via webhook) ----------
+  app.get('/api/events', (req, res) => {
+    res.set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-store, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no', // disable proxy buffering (Caddy/nginx)
+    });
+    res.flushHeaders?.();
+    res.write(`event: connected\ndata: ${JSON.stringify({ at: Date.now() })}\n\n`);
+    sseClients.add(res);
+    // Heartbeat every 20s so proxies don't kill the idle connection
+    const hb = setInterval(() => {
+      try { res.write(`: hb ${Date.now()}\n\n`); } catch {}
+    }, 20000);
+    req.on('close', () => {
+      clearInterval(hb);
+      sseClients.delete(res);
+    });
+  });
+
+  // ---------- Notion webhook receiver ----------
+  // Handles two kinds of POSTs from Notion:
+  //   1. Verification: body has { verification_token: '...' } — Notion's
+  //      handshake. Save the token (becomes our HMAC secret) and echo it.
+  //   2. Events: page.content_updated, block.created, etc. Verify HMAC,
+  //      invalidate caches, broadcast SSE.
+  app.post('/api/notion-webhook', async (req, res) => {
+    const rawBody = req.body; // Buffer (from express.raw above)
+    let payload;
+    try {
+      payload = JSON.parse(rawBody.toString('utf-8'));
+    } catch {
+      return res.status(400).json({ error: 'invalid JSON' });
+    }
+
+    // Verification handshake
+    if (payload.verification_token) {
+      webhookSecret = payload.verification_token;
+      try {
+        await fs.writeFile(WEBHOOK_SECRET_FILE, webhookSecret + '\n', { mode: 0o600 });
+      } catch (e) {
+        console.error('[webhook] could not persist secret:', e?.message || e);
+      }
+      console.log('[webhook] verification handshake complete, secret stored');
+      return res.json({ verification_token: payload.verification_token });
+    }
+
+    // Signature verification (after we have a secret)
+    if (webhookSecret) {
+      const sig = req.header('x-notion-signature') || req.header('X-Notion-Signature');
+      const expected = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+      if (!sig || sig !== expected) {
+        console.error('[webhook] signature mismatch (sig=' + sig + ', expected=' + expected + ')');
+        return res.status(401).json({ error: 'invalid signature' });
+      }
+    }
+
+    const eventType = payload.type || payload.event_type || 'unknown';
+    console.log(`[webhook] event: ${eventType}`);
+    debouncedInvalidate(eventType);
+    res.json({ ok: true });
   });
 
   app.get('/api/presenting', (_req, res) => res.json({ currentlyPresenting }));

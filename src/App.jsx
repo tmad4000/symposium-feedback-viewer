@@ -1,10 +1,43 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 
-function useFeedback(intervalMs = 3000) {
+// URL state management — keeps view/attendee/presenting in the URL so the
+// back button works, refreshes preserve state, and links are shareable.
+function useUrlState() {
+  const [params, setParams] = useState(() => new URLSearchParams(window.location.search));
+  useEffect(() => {
+    const onPop = () => setParams(new URLSearchParams(window.location.search));
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+  const update = (updates, { replace = false } = {}) => {
+    const next = new URLSearchParams(window.location.search);
+    for (const [k, v] of Object.entries(updates)) {
+      if (v == null || v === '') next.delete(k);
+      else next.set(k, String(v));
+    }
+    const qs = next.toString();
+    const url = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
+    if (replace) window.history.replaceState({}, '', url);
+    else window.history.pushState({}, '', url);
+    setParams(new URLSearchParams(next));
+  };
+  return [params, update];
+}
+
+// Live data via SSE push (sub-second) + polling fallback (15s).
+//
+// Primary signal: server's /api/events SSE channel emits "update" the
+// moment a Notion webhook fires. We refetch immediately.
+//
+// Fallback: setTimeout polls every fallbackMs (default 15s) — covers
+// SSE disconnects, network blips, and the case where the webhook isn't
+// configured at all (in which case polling alone keeps things working).
+function useFeedback(fallbackMs = 15000) {
   const [data, setData] = useState(null);
   const [lastFetchedAt, setLastFetchedAt] = useState(null);
   const [error, setError] = useState(null);
+  const [transport, setTransport] = useState('polling'); // 'polling' | 'sse'
   const mounted = useRef(true);
   const tickRef = useRef(null);
   const timerRef = useRef(null);
@@ -15,7 +48,6 @@ function useFeedback(intervalMs = 3000) {
 
     async function tick() {
       try {
-        // Cache-bust at the URL level for paranoid proxies
         const res = await fetch(`/api/feedback?t=${Date.now()}`, { cache: 'no-store' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
@@ -29,16 +61,32 @@ function useFeedback(intervalMs = 3000) {
       } finally {
         if (!stopped) {
           clearTimeout(timerRef.current);
-          timerRef.current = setTimeout(tick, intervalMs);
+          timerRef.current = setTimeout(tick, fallbackMs);
         }
       }
     }
     tickRef.current = tick;
     tick();
 
-    // Browsers throttle setTimeout to ≥60s in background tabs. Force a fresh
-    // fetch the moment the tab regains focus or visibility, so re-opening
-    // the tab shows current data immediately.
+    // SSE: instant push when Notion webhook fires
+    let es;
+    try {
+      es = new EventSource('/api/events');
+      es.addEventListener('connected', () => setTransport('sse'));
+      es.addEventListener('update', () => {
+        // Immediate refetch — server already invalidated its cache
+        clearTimeout(timerRef.current);
+        tick();
+      });
+      es.onerror = () => {
+        // EventSource auto-reconnects; downgrade label but polling fallback covers us
+        setTransport('polling');
+      };
+    } catch (e) {
+      console.warn('EventSource unsupported, polling-only mode', e);
+    }
+
+    // Force-poll on tab refocus / network reconnect
     function onWake() {
       if (document.visibilityState === 'visible' && tickRef.current) {
         clearTimeout(timerRef.current);
@@ -53,13 +101,14 @@ function useFeedback(intervalMs = 3000) {
       stopped = true;
       mounted.current = false;
       clearTimeout(timerRef.current);
+      es?.close();
       document.removeEventListener('visibilitychange', onWake);
       window.removeEventListener('focus', onWake);
       window.removeEventListener('online', onWake);
     };
-  }, [intervalMs]);
+  }, [fallbackMs]);
 
-  return { data, lastFetchedAt, error };
+  return { data, lastFetchedAt, error, transport };
 }
 
 function useAge(ts) {
@@ -217,7 +266,17 @@ function formatRelativeTime(iso) {
   return `${d}d ago`;
 }
 
-function ByAttendeeView({ data, isFlashing }) {
+function ByAttendeeView({ data, isFlashing, focusAttendee, onBack }) {
+  // Scroll to the focused attendee on mount / when focusAttendee changes
+  useEffect(() => {
+    if (!focusAttendee) return;
+    requestAnimationFrame(() => {
+      const el = document.getElementById(`attendee-${focusAttendee.replace(/\s+/g,'-')}`);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }, [focusAttendee]);
+
+
   const { reactions, teamDescriptors, notebookUrls, roster = [] } = data;
   // Pivot reactions: byAttendee[name][teamNum] = markdown
   const pivot = {};
@@ -260,8 +319,16 @@ function ByAttendeeView({ data, isFlashing }) {
 
   return (
     <div className="space-y-8">
-      <div className="text-[12px] font-mono text-ink-500">
-        {totalCount} attendee{totalCount === 1 ? '' : 's'} in roster · {contributorCount} contributing
+      <div className="flex items-baseline justify-between gap-3 mb-2">
+        <button
+          onClick={onBack}
+          className="text-[13px] font-mono text-ink-700 hover:text-amber-600 inline-flex items-baseline gap-1"
+        >
+          <span className="text-ink-500">←</span> back to By Talk
+        </button>
+        <div className="text-[12px] font-mono text-ink-500">
+          {totalCount} attendee{totalCount === 1 ? '' : 's'} · {contributorCount} contributing
+        </div>
       </div>
 
       {sorted.map((name) => {
@@ -544,10 +611,13 @@ function MockAdder({ data, onAdded }) {
 }
 
 export default function App() {
-  const { data, lastFetchedAt, error } = useFeedback(3000);
+  const { data, lastFetchedAt, error, transport } = useFeedback(15000);
   const age = useAge(lastFetchedAt);
   const isFlashing = useFlashTracker(data?.reactions);
-  const [view, setView] = useState('by-talk'); // 'by-talk' | 'by-attendee'
+  const [urlState, setUrlState] = useUrlState();
+  const view = urlState.get('view') === 'by-attendee' ? 'by-attendee' : 'by-talk';
+  const focusAttendee = urlState.get('attendee');
+  const setView = (v) => setUrlState({ view: v === 'by-talk' ? null : v, attendee: null });
 
   // Stitch team list with live descriptors taking precedence over mock
   const teamsForView = useMemo(() => {
@@ -581,6 +651,8 @@ export default function App() {
   }, [data]);
 
   const setPresenting = async (num) => {
+    // Update URL first for instant feedback / shareable links
+    setUrlState({ presenting: num == null ? null : num }, { replace: true });
     await fetch('/api/presenting', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -622,7 +694,7 @@ export default function App() {
                     {data.stale
                       ? 'stale (backoff)'
                       : data.mode === 'notion'
-                      ? 'live · notion'
+                      ? `live · notion${transport === 'sse' ? ' · ⚡push' : ' · poll'}`
                       : data.mode === 'notion-error'
                       ? 'notion error'
                       : 'demo · mock'}
@@ -652,24 +724,32 @@ export default function App() {
                 )}
               </div>
             </div>
-            <div className="flex items-center gap-1 text-[12px] font-mono">
+            <div role="tablist" className="inline-flex items-center gap-0 text-[12px] font-mono border border-ink-200 rounded-lg p-0.5 bg-white/70 shadow-sm">
               <button
+                role="tab"
+                aria-selected={view === 'by-talk'}
                 onClick={() => setView('by-talk')}
                 className={[
-                  'px-2.5 py-1 rounded',
-                  view === 'by-talk' ? 'bg-ink-900 text-ink-50' : 'text-ink-500 hover:text-ink-900',
+                  'px-3 py-1 rounded-md transition-colors',
+                  view === 'by-talk'
+                    ? 'bg-ink-900 text-ink-50'
+                    : 'text-ink-700 hover:bg-ink-100',
                 ].join(' ')}
               >
-                by talk
+                By Talk
               </button>
               <button
+                role="tab"
+                aria-selected={view === 'by-attendee'}
                 onClick={() => setView('by-attendee')}
                 className={[
-                  'px-2.5 py-1 rounded',
-                  view === 'by-attendee' ? 'bg-ink-900 text-ink-50' : 'text-ink-500 hover:text-ink-900',
+                  'px-3 py-1 rounded-md transition-colors',
+                  view === 'by-attendee'
+                    ? 'bg-ink-900 text-ink-50'
+                    : 'text-ink-700 hover:bg-ink-100',
                 ].join(' ')}
               >
-                by attendee
+                By Attendee
               </button>
             </div>
           </div>
@@ -685,12 +765,7 @@ export default function App() {
                     <span className="inline-flex items-baseline">
                       <button
                         onClick={() => {
-                          setView('by-attendee');
-                          // wait one frame so the by-attendee tab renders, then scroll
-                          requestAnimationFrame(() => {
-                            const el = document.getElementById(`attendee-${r.name.replace(/\s+/g,'-')}`);
-                            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                          });
+                          setUrlState({ view: 'by-attendee', attendee: r.name });
                         }}
                         className={[
                           'hover:text-amber-600 transition-colors',
@@ -757,7 +832,12 @@ export default function App() {
             <MockAdder data={data} />
           </>
         ) : (
-          <ByAttendeeView data={data} isFlashing={isFlashing} />
+          <ByAttendeeView
+            data={data}
+            isFlashing={isFlashing}
+            focusAttendee={focusAttendee}
+            onBack={() => setView('by-talk')}
+          />
         )}
 
         {data?.errors?.length > 0 && (
@@ -768,7 +848,17 @@ export default function App() {
         )}
 
         <footer className="mt-12 pb-12 text-center text-[11px] text-ink-500 font-mono">
-          Reading from {data?.mode === 'notion' ? 'Notion' : 'mock data'} · polls every 3s · empty teams hidden
+          {data ? (
+            <>
+              Reading from {data.mode === 'notion' ? 'Notion' : data.mode === 'mock' ? 'mock data' : 'Notion (degraded)'}
+              {' · '}
+              {transport === 'sse' ? 'live push' : 'polling every 15s'}
+              {' · '}
+              empty teams hidden
+            </>
+          ) : (
+            <>Loading…</>
+          )}
         </footer>
       </main>
     </div>

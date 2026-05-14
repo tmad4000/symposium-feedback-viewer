@@ -100,27 +100,102 @@ export function getNotebooks() {
   return notebookCache.list;
 }
 
-// Claim a placeholder notebook by renaming it. Looks for an "Attendee N"
-// notebook (or any title containing the word "Attendee") and renames it
-// to the given name. Returns the renamed notebook info, or null if no
-// placeholder is available.
-export async function claimPlaceholder(newName) {
+// Template for a new attendee notebook. 18 (H2 + synced_block_ORIGINAL) pairs.
+// CRITICAL: each synced_block must be an ORIGINAL (synced_from: null) so the
+// new attendee's edits stay in their own notebook. If we used `duplicate-page`
+// instead, Notion would create REFERENCES back to the source — and all
+// attendees would share one set of blocks (verified the hard way).
+function buildNotebookChildren(teamDescriptors = {}) {
+  const children = [];
+  // Intro paragraph
+  children.push({
+    object: 'block',
+    type: 'paragraph',
+    paragraph: {
+      rich_text: [
+        { type: 'text', text: { content: 'Symposium notebook. Type your reactions in the synced blocks below — they appear on the read view live.' }, annotations: { italic: true } },
+      ],
+    },
+  });
+  children.push({ object: 'block', type: 'divider', divider: {} });
+  // 18 (H2 + synced_block_original) pairs
+  for (let n = 1; n <= 18; n++) {
+    const descriptor = teamDescriptors[n];
+    const headingText = descriptor ? `Team ${n} — ${descriptor}` : `Team ${n}`;
+    children.push({
+      object: 'block',
+      type: 'heading_2',
+      heading_2: { rich_text: [{ type: 'text', text: { content: headingText } }] },
+    });
+    children.push({
+      object: 'block',
+      type: 'synced_block',
+      synced_block: {
+        synced_from: null, // ORIGINAL — not a reference
+        children: [
+          {
+            object: 'block',
+            type: 'paragraph',
+            paragraph: {
+              rich_text: [
+                { type: 'text', text: { content: '(your reactions here)' }, annotations: { italic: true, color: 'gray' } },
+              ],
+            },
+          },
+        ],
+      },
+    });
+  }
+  return children;
+}
+
+// Hub page that holds all attendee notebooks. Hardcoded above as HUB_PAGE_ID_NO_DASHES.
+const HUB_PARENT_ID = HUB_PAGE_ID_NO_DASHES;
+
+// Create a brand-new attendee notebook from scratch as a child of the v5 hub.
+// Returns { name, url, pageId } on success.
+export async function createAttendeeNotebook(name, teamDescriptors = {}) {
   const client = getNotion();
   if (!client) throw new Error('NOTION_TOKEN not set');
-  // Always re-discover so we work against current Notion state, not stale cache
+  const title = `📓 ${name} — notebook`;
+  const page = await client.pages.create({
+    parent: { type: 'page_id', page_id: HUB_PARENT_ID },
+    properties: { title: { title: [{ type: 'text', text: { content: title } }] } },
+    icon: { type: 'emoji', emoji: '📓' },
+    children: buildNotebookChildren(teamDescriptors),
+  });
+  // Invalidate so the new notebook is discovered on the next fetch
+  notebookCache = { at: 0, list: [] };
+  return {
+    name,
+    url: page.url || `https://www.notion.so/${page.id.replace(/-/g, '')}`,
+    pageId: page.id,
+  };
+}
+
+// Delete a notebook page. Used to clean up the broken bulk-duplicate placeholders.
+export async function deleteNotebook(pageId) {
+  const client = getNotion();
+  if (!client) throw new Error('NOTION_TOKEN not set');
+  await client.blocks.delete({ block_id: pageId });
+  notebookCache = { at: 0, list: [] };
+  syncedBlockCache.delete(pageId);
+}
+
+// Find and delete every notebook whose title matches "Attendee N" — the broken
+// bulk-duplicate placeholders. Returns count of pages deleted.
+export async function purgeBrokenPlaceholders() {
   notebookCache = { at: 0, list: [] };
   const notebooks = await discoverNotebooks();
-  const placeholder = notebooks.find((nb) => /^attendee\s+\d+$/i.test(nb.name));
-  if (!placeholder) return null;
-  const title = `📓 ${newName} — notebook`;
-  await client.pages.update({
-    page_id: placeholder.pageId,
-    properties: { title: { title: [{ type: 'text', text: { content: title } }] } },
-  });
-  // Invalidate caches so the rename surfaces on next poll
-  notebookCache = { at: 0, list: [] };
-  syncedBlockCache.delete(placeholder.pageId);
-  return { previousName: placeholder.name, newName, url: placeholder.url, pageId: placeholder.pageId };
+  const placeholders = notebooks.filter((nb) => /^attendee\s+\d+$/i.test(nb.name));
+  for (const p of placeholders) {
+    try {
+      await deleteNotebook(p.pageId);
+    } catch (e) {
+      console.error(`[purge] failed to delete ${p.name}: ${e?.message || e}`);
+    }
+  }
+  return placeholders.length;
 }
 
 // List ONE level of children (no recursion). Used to read the notebook's
@@ -211,6 +286,13 @@ function renderChildrenAsMarkdown(children) {
 // changes (verified empirically), so caching at page level misses live
 // edits. Each synced block has its own last_edited_time that DOES bump.
 const syncedBlockCache = new Map(); // blockId -> { lastEditedTime, text }
+
+// Called by webhook handler when Notion reports a change. Clears caches
+// so the next read from Notion picks up the latest content.
+export function invalidateCaches() {
+  notebookCache = { at: 0, list: [] };
+  syncedBlockCache.clear();
+}
 
 // Run async tasks with a concurrency cap — prevents bursting past Notion's
 // 3 req/s rate limit when many notebooks need refreshing at once.
