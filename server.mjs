@@ -88,12 +88,13 @@ async function getLiveData() {
   }
 
   try {
-    const { reactions, teamDescriptors, errors } = await fetchAllReactions();
+    const { reactions, teamDescriptors, errors, newestEdit } = await fetchAllReactions();
     cachedNotion = {
       mode: 'notion',
       reactions,
       teamDescriptors,
       errors,
+      newestEdit,
       notebookUrls: Object.fromEntries(getNotebooks().map((n) => [n.name, n.url])),
       hubUrl: HUB_URL,
       masterViewUrl: MASTER_VIEW_URL,

@@ -280,12 +280,19 @@ function renderChildrenAsMarkdown(children) {
 }
 
 // Returns { reactions: { teamNum: { attendee: markdown } }, teamDescriptors: { num: str } }
-// Synced-block content cache keyed on blockId. Stores the rendered markdown
-// alongside the synced_block's own last_edited_time. The PAGE's
-// last_edited_time does NOT bump when a child synced_block's content
-// changes (verified empirically), so caching at page level misses live
-// edits. Each synced block has its own last_edited_time that DOES bump.
-const syncedBlockCache = new Map(); // blockId -> { lastEditedTime, text }
+// Synced-block content cache keyed on blockId. Stores the rendered markdown.
+//
+// Originally I keyed cache invalidation on the synced_block's own
+// last_edited_time, assuming that would bump when its children changed.
+// EMPIRICALLY IT DOES NOT — modifying a child paragraph inside a synced
+// block leaves the synced_block's last_edited_time stale (verified).
+// So we now ALSO cap entries with a TTL — even if last_edited_time says
+// "unchanged", we re-fetch after SYNCED_BLOCK_TTL_MS to catch live edits.
+//
+// Until Notion webhooks reliably fire (they're set up but events haven't
+// been arriving), this TTL bounds the worst-case visible lag.
+const SYNCED_BLOCK_TTL_MS = 25_000;
+const syncedBlockCache = new Map(); // blockId -> { lastEditedTime, text, cachedAt }
 
 // Called by webhook handler when Notion reports a change. Clears caches
 // so the next read from Notion picks up the latest content.
@@ -350,13 +357,14 @@ async function fetchNotebookBuckets(client, pageId) {
 
     const cached = syncedBlockCache.get(blockId);
     let text;
-    if (cached && cached.lastEditedTime === blockEdit) {
+    const cacheStillFresh = cached && cached.cachedAt && (Date.now() - cached.cachedAt) < SYNCED_BLOCK_TTL_MS;
+    if (cached && cached.lastEditedTime === blockEdit && cacheStillFresh) {
       text = cached.text;
       hits++;
     } else {
       const children = await listDirectChildren(client, blockId);
       text = renderChildrenAsMarkdown(children);
-      syncedBlockCache.set(blockId, { lastEditedTime: blockEdit, text });
+      syncedBlockCache.set(blockId, { lastEditedTime: blockEdit, text, cachedAt: Date.now() });
       misses++;
     }
     if (text) {
@@ -377,12 +385,14 @@ export async function fetchAllReactions() {
   const errors = [];
   let totalHits = 0;
   let totalMisses = 0;
+  let newestEdit = null;               // latest last_edited_time we saw across all blocks
 
   await withConcurrency(notebooks, 2, async (nb) => {
     try {
-      const { teamBuckets, hits, misses } = await fetchNotebookBuckets(client, nb.pageId);
+      const { teamBuckets, hits, misses, latestEdit } = await fetchNotebookBuckets(client, nb.pageId);
       totalHits += hits;
       totalMisses += misses;
+      if (latestEdit && (!newestEdit || latestEdit > newestEdit)) newestEdit = latestEdit;
       for (const [num, { descriptor, text, lastEditedTime }] of Object.entries(teamBuckets)) {
         if (descriptor && !teamDescriptors[num]) teamDescriptors[num] = descriptor;
         if (!reactions[num]) reactions[num] = {};
@@ -412,5 +422,5 @@ export async function fetchAllReactions() {
   if (totalMisses > 0 || totalHits === 0) {
     console.log(`[notion] checked ${notebooks.length} notebook(s): ${totalHits} synced-blocks cached, ${totalMisses} refetched`);
   }
-  return { reactions: orderedReactions, reactionEdits, teamDescriptors, errors };
+  return { reactions: orderedReactions, reactionEdits, teamDescriptors, errors, newestEdit };
 }

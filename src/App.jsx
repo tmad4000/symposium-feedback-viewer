@@ -252,6 +252,21 @@ function TeamBlock({ team, byAttendee, notebookUrls, isFlashing, isCurrent }) {
   );
 }
 
+// Re-renders every second so "Xs ago" stays current
+function NewestEditAge({ iso }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+  if (!iso) return null;
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  if (s < 60) return <span>{s}s ago</span>;
+  const m = Math.floor(s / 60);
+  if (m < 60) return <span>{m}m {s - m * 60}s ago</span>;
+  return <span>{m} min ago</span>;
+}
+
 function formatRelativeTime(iso) {
   if (!iso) return null;
   const then = new Date(iso).getTime();
@@ -679,6 +694,11 @@ export default function App() {
                 <span className={error ? 'text-red-600' : ''}>
                   {error ? `error: ${error}` : `refreshed ${age}`}
                 </span>
+                {data?.newestEdit && (
+                  <span title={`Newest edit detected at ${data.newestEdit}`}>
+                    newest edit <NewestEditAge iso={data.newestEdit} />
+                  </span>
+                )}
                 {data?.mode && (
                   <span
                     className={
