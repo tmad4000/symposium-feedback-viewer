@@ -252,6 +252,20 @@ function TeamBlock({ team, byAttendee, notebookUrls, isFlashing, isCurrent }) {
   );
 }
 
+function LastWebhookAge({ ms }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+  if (!ms) return null;
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return <span>{s}s ago</span>;
+  const m = Math.floor(s / 60);
+  if (m < 60) return <span>{m}m {s - m * 60}s ago</span>;
+  return <span>{m} min ago</span>;
+}
+
 // Re-renders every second so "Xs ago" stays current
 function NewestEditAge({ iso }) {
   const [, setTick] = useState(0);
@@ -695,8 +709,16 @@ export default function App() {
                   {error ? `error: ${error}` : `refreshed ${age}`}
                 </span>
                 {data?.newestEdit && (
-                  <span title={`Newest edit detected at ${data.newestEdit}`}>
+                  <span title={`Newest child-paragraph last_edited_time across all synced blocks: ${data.newestEdit}`}>
                     newest edit <NewestEditAge iso={data.newestEdit} />
+                  </span>
+                )}
+                {data?.lastWebhookAt && (
+                  <span
+                    className="text-emerald-700"
+                    title={`Most recent Notion webhook arrival: ${new Date(data.lastWebhookAt).toISOString()}`}
+                  >
+                    ⚡ webhook <LastWebhookAge ms={data.lastWebhookAt} />
                   </span>
                 )}
                 {data?.mode && (

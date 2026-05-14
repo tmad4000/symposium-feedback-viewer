@@ -353,22 +353,36 @@ async function fetchNotebookBuckets(client, pageId) {
 
     const blockId = b.id;
     const blockEdit = b.last_edited_time;
-    if (blockEdit && (!latestEdit || blockEdit > latestEdit)) latestEdit = blockEdit;
+    // NOTE: do NOT use blockEdit as the "newest edit" signal — it's the
+    // synced_block's metadata last_edited_time, which stays stale even
+    // when children change. We track contentEdit (max child last_edited_time)
+    // below and use that instead.
 
     const cached = syncedBlockCache.get(blockId);
     let text;
+    let contentEdit = blockEdit; // most recent edit time of any CHILD paragraph
     const cacheStillFresh = cached && cached.cachedAt && (Date.now() - cached.cachedAt) < SYNCED_BLOCK_TTL_MS;
     if (cached && cached.lastEditedTime === blockEdit && cacheStillFresh) {
       text = cached.text;
+      contentEdit = cached.contentEdit || blockEdit;
       hits++;
     } else {
       const children = await listDirectChildren(client, blockId);
       text = renderChildrenAsMarkdown(children);
-      syncedBlockCache.set(blockId, { lastEditedTime: blockEdit, text, cachedAt: Date.now() });
+      // The synced_block's own last_edited_time does NOT bump when its
+      // children are edited — but each child paragraph's last_edited_time
+      // DOES. Take the max so the UI can show an accurate "newest edit".
+      for (const c of children) {
+        if (c.last_edited_time && c.last_edited_time > contentEdit) {
+          contentEdit = c.last_edited_time;
+        }
+      }
+      syncedBlockCache.set(blockId, { lastEditedTime: blockEdit, contentEdit, text, cachedAt: Date.now() });
       misses++;
     }
+    if (contentEdit && (!latestEdit || contentEdit > latestEdit)) latestEdit = contentEdit;
     if (text) {
-      teamBuckets[currentTeam] = { descriptor: currentDescriptor, text, lastEditedTime: blockEdit };
+      teamBuckets[currentTeam] = { descriptor: currentDescriptor, text, lastEditedTime: contentEdit };
     }
   }
   return { teamBuckets, hits, misses, latestEdit };

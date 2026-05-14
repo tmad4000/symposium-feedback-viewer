@@ -139,6 +139,8 @@ async function doFreshFetch() {
 // ---------- SSE + webhook state ----------
 const sseClients = new Set();
 let webhookSecret = process.env.NOTION_WEBHOOK_SECRET || null;
+// Track webhook arrivals for latency observability — ring buffer of recent timestamps + types
+const webhookActivity = []; // [{at: ms, type: string}], newest first, max 20
 const WEBHOOK_SECRET_FILE = path.join(__dirname, '.webhook-secret');
 try {
   if (!webhookSecret) webhookSecret = (await fs.readFile(WEBHOOK_SECRET_FILE, 'utf-8')).trim() || null;
@@ -213,6 +215,7 @@ async function main() {
       hubUrl: data.hubUrl || HUB_URL,
       masterViewUrl: data.masterViewUrl || MASTER_VIEW_URL,
       currentlyPresenting,
+      lastWebhookAt: webhookActivity[0]?.at || null,
     });
   });
 
@@ -320,9 +323,23 @@ async function main() {
     }
 
     const eventType = payload.type || payload.event_type || 'unknown';
-    console.log(`[webhook] event: ${eventType}`);
+    const arrivedAt = Date.now();
+    webhookActivity.unshift({ at: arrivedAt, type: eventType });
+    if (webhookActivity.length > 20) webhookActivity.length = 20;
+    console.log(`[webhook] event: ${eventType} at ${new Date(arrivedAt).toISOString()}`);
     debouncedInvalidate(eventType);
     res.json({ ok: true });
+  });
+
+  // Webhook activity inspector — last 20 events with arrival times.
+  // Use to compute end-to-end latency (edit time → webhook arrival).
+  app.get('/api/webhook-activity', (_req, res) => {
+    res.json({
+      recent: webhookActivity,
+      lastWebhookAt: webhookActivity[0]?.at || null,
+      lastWebhookType: webhookActivity[0]?.type || null,
+      now: Date.now(),
+    });
   });
 
   app.get('/api/presenting', (_req, res) => res.json({ currentlyPresenting }));
