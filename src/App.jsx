@@ -295,6 +295,62 @@ function formatRelativeTime(iso) {
   return `${d}d ago`;
 }
 
+// Pure directory view: just attendee names + last-edit time + Notion link.
+// No reaction content. Designed to be shareable at /notebooks.
+function NotebooksView({ data, onBack }) {
+  const roster = data?.roster || [];
+  if (roster.length === 0) {
+    return (
+      <div className="text-center py-16 text-ink-500 italic font-serif">
+        No notebooks discovered yet.
+      </div>
+    );
+  }
+  const sorted = [...roster].sort((a, b) => {
+    const at = a.lastEditedTime || '';
+    const bt = b.lastEditedTime || '';
+    if (at !== bt) return bt.localeCompare(at);
+    return a.name.localeCompare(b.name);
+  });
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-3 mb-4">
+        <button
+          onClick={onBack}
+          className="text-[13px] font-mono text-ink-700 hover:text-amber-600 inline-flex items-baseline gap-1"
+        >
+          <span className="text-ink-500">←</span> back to By Talk
+        </button>
+        <div className="text-[12px] font-mono text-ink-500">
+          {sorted.length} notebook{sorted.length === 1 ? '' : 's'}
+        </div>
+      </div>
+      <h2 className="font-serif text-[26px] tracking-tight text-ink-900 mb-1">Attendee Notebooks</h2>
+      <p className="text-[13px] text-ink-500 font-mono mb-6">
+        Each attendee has their own Notion page. Click to open.
+      </p>
+      <ul className="divide-y divide-ink-200/60 border border-ink-200/60 rounded-xl overflow-hidden bg-white/70">
+        {sorted.map((r) => (
+          <li key={r.name}>
+            <a
+              href={r.url || '#'}
+              target="_blank"
+              rel="noreferrer"
+              className="flex items-baseline justify-between gap-4 px-4 py-3 hover:bg-amber-50/60 transition-colors"
+            >
+              <span className="font-serif text-[20px] text-ink-900">{r.name}</span>
+              <span className="text-[12px] font-mono text-ink-500 inline-flex items-baseline gap-3 shrink-0">
+                {r.lastEditedTime && <span>edited {formatRelativeTime(r.lastEditedTime)}</span>}
+                <span className="text-amber-600">open in Notion ↗</span>
+              </span>
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function ByAttendeeView({ data, isFlashing, focusAttendee, onBack }) {
   // Scroll to the focused attendee on mount / when focusAttendee changes
   useEffect(() => {
@@ -644,7 +700,8 @@ export default function App() {
   const age = useAge(lastFetchedAt);
   const isFlashing = useFlashTracker(data?.reactions);
   const [urlState, setUrlState] = useUrlState();
-  const view = urlState.get('view') === 'by-attendee' ? 'by-attendee' : 'by-talk';
+  const viewParam = urlState.get('view');
+  const view = viewParam === 'by-attendee' ? 'by-attendee' : viewParam === 'notebooks' ? 'notebooks' : 'by-talk';
   const focusAttendee = urlState.get('attendee');
   const setView = (v) => setUrlState({ view: v === 'by-talk' ? null : v, attendee: null });
 
@@ -742,6 +799,14 @@ export default function App() {
                       : 'demo · mock'}
                   </span>
                 )}
+                <a
+                  href="/notebooks"
+                  onClick={(e) => { e.preventDefault(); setUrlState({ view: 'notebooks', attendee: null }); }}
+                  className="text-ink-500 hover:text-amber-600 underline decoration-dotted underline-offset-2"
+                  title="Directory of all attendee notebooks"
+                >
+                  📓 all notebooks
+                </a>
                 {data?.masterViewUrl && (
                   <a
                     href={data.masterViewUrl}
@@ -848,6 +913,8 @@ export default function App() {
       <main className="max-w-4xl mx-auto px-4 sm:px-6 py-6">
         {!data ? (
           <div className="text-center py-24 text-ink-500 italic font-serif text-xl">loading…</div>
+        ) : view === 'notebooks' ? (
+          <NotebooksView data={data} onBack={() => setView('by-talk')} />
         ) : view === 'by-talk' ? (
           <>
             {teamsWithContent === 0 && data?.mode === 'notion' && (

@@ -369,6 +369,10 @@ async function main() {
     res.json({ currentlyPresenting });
   });
 
+  // Short URL → notebook-directory view. /notebooks redirects to the SPA
+  // with the directory view pre-selected (shareable link, no reactions shown).
+  app.get('/notebooks', (_req, res) => res.redirect(302, '/?view=notebooks'));
+
   // Static files from dist/
   app.use(express.static(DIST, { maxAge: '1h', index: false }));
   app.get('*', (_req, res) => res.sendFile(path.join(DIST, 'index.html')));
