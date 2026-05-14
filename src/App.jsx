@@ -640,7 +640,7 @@ function MockAdder({ data, onAdded }) {
 }
 
 export default function App() {
-  const { data, lastFetchedAt, error, transport } = useFeedback(15000);
+  const { data, lastFetchedAt, error, transport } = useFeedback(3000);
   const age = useAge(lastFetchedAt);
   const isFlashing = useFlashTracker(data?.reactions);
   const [urlState, setUrlState] = useUrlState();
@@ -894,7 +894,7 @@ export default function App() {
             <>
               Reading from {data.mode === 'notion' ? 'Notion' : data.mode === 'mock' ? 'mock data' : 'Notion (degraded)'}
               {' · '}
-              {transport === 'sse' ? 'live push' : 'polling every 15s'}
+              {transport === 'sse' ? 'live push + polling' : 'polling every 3s'}
               {' · '}
               empty teams hidden
             </>

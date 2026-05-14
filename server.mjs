@@ -46,7 +46,9 @@ let cachedNotion = null; // last successful payload (keeps showing during transi
 let lastError = null;
 let inFlightFetch = null; // dedup concurrent fetches — when SSE pushes to N
                           // clients, only one hits Notion; the rest await
-const NOTION_TTL_MS = 4000;       // normal cache window
+// 2s response cache — short enough to keep visible lag <5s, long enough to
+// dedupe concurrent client polls so we don't burst past Notion's 3 req/s limit
+const NOTION_TTL_MS = 2000;
 const ERROR_BACKOFF_MS = 15_000;  // generic error backoff
 const RATE_LIMIT_BACKOFF_MS = 45_000; // longer when Notion explicitly rate-limits
 
@@ -324,9 +326,27 @@ async function main() {
 
     const eventType = payload.type || payload.event_type || 'unknown';
     const arrivedAt = Date.now();
-    webhookActivity.unshift({ at: arrivedAt, type: eventType });
+    // Notion's webhook payload includes a "timestamp" field with the actual
+    // event time (sub-second precision). Compare to arrival → network+processing latency.
+    const eventTimestamp = payload.timestamp || payload.event_timestamp || payload.created_time || null;
+    let latencyMs = null;
+    if (eventTimestamp) {
+      const eventMs = new Date(eventTimestamp).getTime();
+      if (!Number.isNaN(eventMs)) latencyMs = arrivedAt - eventMs;
+    }
+    // Capture entity info if present (which block/page changed)
+    const entity = payload.entity || payload.data?.entity || null;
+    const entityId = entity?.id || payload.data?.parent?.id || null;
+    webhookActivity.unshift({
+      at: arrivedAt,
+      type: eventType,
+      eventTimestamp,
+      latencyMs,
+      entityId,
+      payloadKeys: Object.keys(payload).slice(0, 20),
+    });
     if (webhookActivity.length > 20) webhookActivity.length = 20;
-    console.log(`[webhook] event: ${eventType} at ${new Date(arrivedAt).toISOString()}`);
+    console.log(`[webhook] event: ${eventType} arrived=${new Date(arrivedAt).toISOString()} eventTs=${eventTimestamp} latency=${latencyMs}ms`);
     debouncedInvalidate(eventType);
     res.json({ ok: true });
   });

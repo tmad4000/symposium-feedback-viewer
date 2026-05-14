@@ -291,7 +291,12 @@ function renderChildrenAsMarkdown(children) {
 //
 // Until Notion webhooks reliably fire (they're set up but events haven't
 // been arriving), this TTL bounds the worst-case visible lag.
-const SYNCED_BLOCK_TTL_MS = 25_000;
+// 15s TTL — bounded worst-case visible lag at ~18s (15 + 3 polling). For 4
+// active notebooks this is ~4.8 req/s peak which occasionally trips Notion's
+// 3 req/s ceiling; backoff handles it cleanly. Don't go lower without
+// rethinking the per-block fetch model — N attendees × 18 blocks / TTL is
+// the API budget.
+const SYNCED_BLOCK_TTL_MS = 15_000;
 const syncedBlockCache = new Map(); // blockId -> { lastEditedTime, text, cachedAt }
 
 // Called by webhook handler when Notion reports a change. Clears caches
